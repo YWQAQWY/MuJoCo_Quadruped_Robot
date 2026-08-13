@@ -1,0 +1,113 @@
+<mujoco model="quadruped">
+  <!-- 12-DOF 四足机械狗：4 条腿 × 3 关节（hip_ab 横摆 / hip_pitch 髋俯仰 / knee 膝俯仰） -->
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+
+  <default>
+    <joint damping="0.1" frictionloss="0.0" armature="0.01"/>
+    <motor ctrllimited="true" ctrlrange="-33.5 33.5" gear="1"/>
+    <geom condim="3"/>
+  </default>
+
+  <worldbody>
+    <light directional="true" pos="1 1 2" dir="-0.5 -0.5 -1"/>
+    <camera name="track" mode="trackcom" target="torso" pos="1.0 -1.0 0.7"
+            xyaxes="0.707 0.707 0  -0.311 0.311 0.891"/>
+    <geom name="floor" type="plane" pos="0 0 0" size="20 20 0.1"
+          friction="1.0 0.005 0.0001" rgba="0.80 0.80 0.85 1"/>
+
+    <!-- 躯干：自由关节基座，四条腿都嵌套在躯干下 -->
+    <body name="torso" pos="0 0 0.38">
+      <freejoint/>
+      <geom name="torso" type="box" size="0.25 0.11 0.06" mass="5.0"
+            rgba="0.85 0.45 0.15 1"/>
+
+    <!-- 前左腿 -->
+    <body name="FL_hip" pos="0.19 0.11 -0.06">
+      <joint name="FL_hip_ab" type="hinge" axis="1 0 0" range="-0.5 0.5"/>
+      <geom type="box" size="0.05 0.04 0.03" mass="0.8" rgba="0.35 0.35 0.40 1"/>
+      <body name="FL_thigh" pos="0 0 0">
+        <joint name="FL_hip_pitch" type="hinge" axis="0 1 0" range="-1.0 1.4"/>
+        <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.6" rgba="0.35 0.35 0.40 1"/>
+        <body name="FL_shank" pos="0 0 -0.2">
+          <joint name="FL_knee" type="hinge" axis="0 1 0" range="-2.9 0.0"/>
+          <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.35" rgba="0.30 0.30 0.35 1"/>
+          <geom name="FL_foot" type="sphere" size="0.02" pos="0 0 -0.2" mass="0.05"
+                friction="1.0 0.005 0.0001" rgba="0.15 0.15 0.18 1"/>
+        </body>
+      </body>
+    </body>
+
+    <!-- 前右腿 -->
+    <body name="FR_hip" pos="0.19 -0.11 -0.06">
+      <joint name="FR_hip_ab" type="hinge" axis="1 0 0" range="-0.5 0.5"/>
+      <geom type="box" size="0.05 0.04 0.03" mass="0.8" rgba="0.35 0.35 0.40 1"/>
+      <body name="FR_thigh" pos="0 0 0">
+        <joint name="FR_hip_pitch" type="hinge" axis="0 1 0" range="-1.0 1.4"/>
+        <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.6" rgba="0.35 0.35 0.40 1"/>
+        <body name="FR_shank" pos="0 0 -0.2">
+          <joint name="FR_knee" type="hinge" axis="0 1 0" range="-2.9 0.0"/>
+          <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.35" rgba="0.30 0.30 0.35 1"/>
+          <geom name="FR_foot" type="sphere" size="0.02" pos="0 0 -0.2" mass="0.05"
+                friction="1.0 0.005 0.0001" rgba="0.15 0.15 0.18 1"/>
+        </body>
+      </body>
+    </body>
+
+    <!-- 后左腿 -->
+    <body name="RL_hip" pos="-0.19 0.11 -0.06">
+      <joint name="RL_hip_ab" type="hinge" axis="1 0 0" range="-0.5 0.5"/>
+      <geom type="box" size="0.05 0.04 0.03" mass="0.8" rgba="0.35 0.35 0.40 1"/>
+      <body name="RL_thigh" pos="0 0 0">
+        <joint name="RL_hip_pitch" type="hinge" axis="0 1 0" range="-1.0 1.4"/>
+        <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.6" rgba="0.35 0.35 0.40 1"/>
+        <body name="RL_shank" pos="0 0 -0.2">
+          <joint name="RL_knee" type="hinge" axis="0 1 0" range="-2.9 0.0"/>
+          <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.35" rgba="0.30 0.30 0.35 1"/>
+          <geom name="RL_foot" type="sphere" size="0.02" pos="0 0 -0.2" mass="0.05"
+                friction="1.0 0.005 0.0001" rgba="0.15 0.15 0.18 1"/>
+        </body>
+      </body>
+    </body>
+
+    <!-- 后右腿 -->
+    <body name="RR_hip" pos="-0.19 -0.11 -0.06">
+      <joint name="RR_hip_ab" type="hinge" axis="1 0 0" range="-0.5 0.5"/>
+      <geom type="box" size="0.05 0.04 0.03" mass="0.8" rgba="0.35 0.35 0.40 1"/>
+      <body name="RR_thigh" pos="0 0 0">
+        <joint name="RR_hip_pitch" type="hinge" axis="0 1 0" range="-1.0 1.4"/>
+        <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.6" rgba="0.35 0.35 0.40 1"/>
+        <body name="RR_shank" pos="0 0 -0.2">
+          <joint name="RR_knee" type="hinge" axis="0 1 0" range="-2.9 0.0"/>
+          <geom type="capsule" fromto="0 0 0  0 0 -0.2" size="0.02" mass="0.35" rgba="0.30 0.30 0.35 1"/>
+          <geom name="RR_foot" type="sphere" size="0.02" pos="0 0 -0.2" mass="0.05"
+                friction="1.0 0.005 0.0001" rgba="0.15 0.15 0.18 1"/>
+        </body>
+      </body>
+    </body>
+    </body><!-- torso -->
+  </worldbody>
+
+  <!-- 默认站姿（参照 A1）：腿序 FL FR RL RR，
+       hip_ab ±0.1（足端外撇）、前腿 hip_pitch 0.8 / 后腿 1.0、膝 -1.5 -->
+  <keyframe>
+    <key name="home" qpos="0 0 0.38 1 0 0 0
+                           0.1 0.8 -1.5  -0.1 0.8 -1.5  0.1 1.0 -1.5  -0.1 1.0 -1.5"/>
+  </keyframe>
+
+  <!-- 12 个电机（PD 力矩由环境代码计算，ctrl 即力矩 Nm） -->
+  <actuator>
+    <motor name="FL_hip_ab"   joint="FL_hip_ab"/>
+    <motor name="FL_hip_pitch" joint="FL_hip_pitch"/>
+    <motor name="FL_knee"     joint="FL_knee"/>
+    <motor name="FR_hip_ab"   joint="FR_hip_ab"/>
+    <motor name="FR_hip_pitch" joint="FR_hip_pitch"/>
+    <motor name="FR_knee"     joint="FR_knee"/>
+    <motor name="RL_hip_ab"   joint="RL_hip_ab"/>
+    <motor name="RL_hip_pitch" joint="RL_hip_pitch"/>
+    <motor name="RL_knee"     joint="RL_knee"/>
+    <motor name="RR_hip_ab"   joint="RR_hip_ab"/>
+    <motor name="RR_hip_pitch" joint="RR_hip_pitch"/>
+    <motor name="RR_knee"     joint="RR_knee"/>
+  </actuator>
+</mujoco>
