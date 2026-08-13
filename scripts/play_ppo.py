@@ -1,7 +1,10 @@
-"""用你自己的 PPO.py 训练出的策略回放并录视频。
+"""用你自己的 PPO.py 训练出的策略回放。
 
-用法：
-    .venv/bin/python scripts/play_ppo.py --checkpoint runs/my_ppo/best.pt
+两种模式：
+    python scripts/play_ppo.py --checkpoint runs/my_ppo/best.pt --viewer
+        # 实时可视化窗口（需要显示器；鼠标拖动旋转视角、滚轮缩放，R 重置）
+    python scripts/play_ppo.py --checkpoint runs/my_ppo/best.pt
+        # 无头模式：离屏渲染录 mp4 视频
 
 注意：这里直接取高斯策略的均值（确定性动作），不经过 take_action，
 所以只要你的 PolicyNet.forward 输出动作均值即可。
@@ -9,23 +12,24 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("MUJOCO_GL", "egl")  # 无头渲染，必须在 import mujoco 前设置
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import imageio  # noqa: E402
-import mujoco  # noqa: E402
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
 
-from env.quadruped_env import QuadrupedEnv, _quat_rotate_inverse  # noqa: E402
-from PPO import PPO  # noqa: E402
+def parse_args():
+    p = argparse.ArgumentParser(description="回放你自己的 PPO 四足狗策略")
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--viewer", action="store_true", help="打开实时可视化窗口（默认录视频）")
+    p.add_argument("--output", type=str, default=None, help="视频输出路径（viewer 模式忽略）")
+    p.add_argument("--duration", type=float, default=20.0)
+    p.add_argument("--fps", type=int, default=50)
+    p.add_argument("--hidden-dim", type=int, default=256)
+    return p.parse_args()
+
 
 # (时长 s, (vx, vy, yaw_rate))
 COMMAND_SCRIPT = [
@@ -36,16 +40,6 @@ COMMAND_SCRIPT = [
     (4.0, (0.5, 0.0, 0.0)),
     (2.0, (0.0, 0.0, 0.0)),
 ]
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="回放你自己的 PPO 四足狗策略并录视频")
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--output", type=str, default=None)
-    p.add_argument("--duration", type=float, default=20.0)
-    p.add_argument("--fps", type=int, default=50)
-    p.add_argument("--hidden-dim", type=int, default=256)
-    return p.parse_args()
 
 
 def command_at(t: float):
@@ -59,22 +53,84 @@ def command_at(t: float):
     return COMMAND_SCRIPT[-1][1]
 
 
-def main():
-    args = parse_args()
-    ckpt_path = Path(args.checkpoint)
-    out_path = Path(args.output) if args.output else \
-        ROOT / "videos" / f"{ckpt_path.parent.name}_{ckpt_path.stem}.mp4"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    env = QuadrupedEnv(seed=0, add_noise=False, randomize=False, command_override=True)
+def load_agent(env, args):
+    import torch
+    from PPO import PPO
 
     agent = PPO(state_dim=env.obs_dim, hidden_dim=args.hidden_dim, action_dim=env.act_dim,
                 actor_lr=1e-3, critic_lr=1e-3, lmbda=0.95, epoch=5, eps=0.2,
                 actor_gamma=0.99, critic_gamma=0.99, device="cpu")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     agent.actor_net.load_state_dict(ckpt["actor"])
     agent.actor_net.eval()
-    print(f"已加载 {ckpt_path}")
+    return agent
+
+
+def get_action(agent, obs):
+    import torch
+
+    with torch.no_grad():
+        obs_t = torch.tensor([obs], dtype=torch.float)
+        return agent.actor_net(obs_t).squeeze(0).numpy()
+
+
+def run_viewer(args, env, agent):
+    """实时可视化窗口：真实时间回放，R 键重置，鼠标旋转视角。"""
+    import mujoco.viewer
+
+    viewer = mujoco.viewer.launch_passive(
+        env.model, env.data,
+        key_callback=lambda key: _on_key(key, env),
+    )
+    print("可视化窗口已打开：鼠标拖动=旋转视角，滚轮=缩放，R=重置，ESC 或关闭窗口退出")
+
+    obs, _ = env.reset()
+    step = 0
+    while viewer.is_running():
+        t = step * env.dt
+        t0 = time.perf_counter()
+
+        env.set_commands(*command_at(t))
+        action = get_action(agent, obs)
+        obs, _, terminated, truncated, info = env.step(action)
+        viewer.sync()
+
+        if terminated:
+            print(f"t={t:.1f}s 机器人摔倒，自动重置")
+            obs, _ = env.reset()
+        if step % 50 == 0:
+            print(f"t={t:5.1f}s  指令=({info['commands'][0]:+.2f}, {info['commands'][1]:+.2f}, "
+                  f"{info['commands'][2]:+.2f})")
+
+        # 真实时间节奏（50 Hz 控制）
+        elapsed = time.perf_counter() - t0
+        time.sleep(max(0.0, env.dt - elapsed))
+        step += 1
+
+    # 关闭窗口后等 viewer 线程完全退出，避免退出时 glfw 销毁竞争导致段错误
+    viewer.close()
+    while viewer.is_running():
+        time.sleep(0.01)
+    time.sleep(0.05)
+
+
+def _on_key(key, env):
+    if key in (82, 114):  # R / r
+        env.reset()
+
+
+def record_video(args, env, agent):
+    import os
+
+    os.environ.setdefault("MUJOCO_GL", "egl")  # 无头渲染后端
+
+    import imageio
+    import mujoco
+
+    ckpt_path = Path(args.checkpoint)
+    out_path = Path(args.output) if args.output else \
+        ROOT / "videos" / f"{ckpt_path.parent.name}_{ckpt_path.stem}.mp4"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     renderer = mujoco.Renderer(env.model, height=480, width=640)
     writer = imageio.get_writer(out_path, fps=args.fps, codec="libx264")
@@ -86,12 +142,7 @@ def main():
     for step in range(total_steps):
         t = step / args.fps
         env.set_commands(*command_at(t))
-
-        # 确定性动作：直接取高斯均值
-        with torch.no_grad():
-            obs_t = torch.tensor([obs], dtype=torch.float)
-            action = agent.actor_net(obs_t).squeeze(0).numpy()
-
+        action = get_action(agent, obs)
         obs, _, terminated, truncated, info = env.step(action)
 
         renderer.update_scene(env.data, camera="track")
@@ -102,6 +153,7 @@ def main():
             obs, _ = env.reset()
 
         if step % args.fps == 0:
+            from env.quadruped_env import _quat_rotate_inverse
             q = env.data.qpos[3:7]
             vel_base = _quat_rotate_inverse(q, env.data.qvel[0:3])
             print(f"t={t:5.1f}s  指令=({info['commands'][0]:+.2f}, {info['commands'][1]:+.2f}, "
@@ -110,6 +162,21 @@ def main():
 
     writer.close()
     print(f"视频已保存: {out_path}  （{total_steps} 帧，用时 {time.time() - t_start:.0f}s）")
+
+
+def main():
+    args = parse_args()
+
+    from env.quadruped_env import QuadrupedEnv
+
+    env = QuadrupedEnv(seed=0, add_noise=False, randomize=False, command_override=True)
+    agent = load_agent(env, args)
+    print(f"已加载 {args.checkpoint}")
+
+    if args.viewer:
+        run_viewer(args, env, agent)
+    else:
+        record_video(args, env, agent)
 
 
 if __name__ == "__main__":

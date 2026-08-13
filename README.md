@@ -22,13 +22,53 @@ L_CLIP = mean(min(ratio·A, clip(ratio, 1−ε, 1+ε)·A))
 loss = −L_CLIP + value_coef·0.5·mean((V−R)²) − entropy_coef·mean(entropy)
 ```
 
+## PPO → PD Control Chain
+
+How the trained PPO policy drives the robot, end to end:
+
+```
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  PPO policy (runs at 50 Hz in PPO.py)                                  │
+  │                                                                        │
+  │  obs (45-d) ──► PolicyNet (Gaussian) ──► sample action a ∈ R¹²        │
+  │                [base ang vel, projected  [clipped to [-1, 1]]          │
+  │                 gravity, commands, joint                               │
+  │                 pos/vel, previous action]                              │
+  └───────────┬──────────────────────────────────────────┬─────────────────┘
+              │ action a (12 joint-target offsets)       │ obs (next state)
+              ▼                                          │
+  ┌──────────────────────────────────────────────────────┴─────────────────┐
+  │  env/quadruped_env.py + control/pd_controller.py (50 Hz)               │
+  │                                                                        │
+  │  1. target joint angles:  q_target = q_default + 0.25 · a              │
+  │  2. PD torque per joint:  τ = 20·(q_target − q) − 0.5·q̇               │
+  │  3. torque limit:         τ ← clip(τ, ±33.5 Nm)                        │
+  └───────────┬────────────────────────────────────────────────────────────┘
+              ▼  τ (12 motor torques)
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  MuJoCo physics (dt = 0.005 s, 200 Hz)                                 │
+  │  4 simulation steps per control step ──► new state (q, q̇, base pose)   │
+  └───────────┬────────────────────────────────────────────────────────────┘
+              │
+              ├──► reward (velocity tracking + penalties) ──► GAE ──► PPO update
+              └──► next obs (45-d) ──► back to policy
+```
+
+- **Policy outputs actions, not torques.** Each of the 12 actions is an offset added to the
+  default joint pose, scaled by 0.25 rad — so the policy "thinks" in joint-angle space.
+- **PD turns angles into torques.** The PD law lives in `control/pd_controller.py`
+  (`set_action` + `compute_torques`); the env calls it every simulation step (200 Hz),
+  holding the target for the whole 20 ms control interval; the policy only updates targets at 50 Hz.
+- **The loop closes through rewards.** Velocity-tracking reward and penalties are accumulated
+  per control step, then converted to advantages via GAE and used by the PPO update in `PPO.py`.
+
 ## Project Structure
 
 ```
 PPO.py                      PPO algorithm (adapted from the repository above, continuous version)
 robot/quadruped.xml         Quadruped model (MuJoCo XML, 4 legs × 3 joints = 12 DOF)
-env/quadruped_env.py        Environment (complete): PD control, observations, rewards,
-                            termination, domain randomization
+env/quadruped_env.py        Environment: observations, rewards, termination, domain randomization
+control/pd_controller.py    PD joint controller: action → target angles → motor torques
 scripts/train_ppo.py        Training loop (calls PPO.py)
 scripts/play_ppo.py         Playback + video recording (loads models trained by PPO.py)
 scripts/plot_results.py     Training curves (can compare against logs/ref_baseline)
@@ -51,7 +91,8 @@ python3 -m venv .venv
 .venv/bin/python scripts/train_ppo.py --iterations 1500 --run-name my_run
 
 # 4. Playback + video + curves
-.venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt
+.venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt --viewer   # live window
+.venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt            # record mp4
 .venv/bin/python scripts/plot_results.py --logs logs/my_run logs/ref_baseline --labels mine baseline
 ```
 

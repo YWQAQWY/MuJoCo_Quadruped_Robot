@@ -4,7 +4,7 @@
     obs, info = env.reset()
     obs, reward, terminated, truncated, info = env.step(action)
 
-控制方式：策略输出 12 维动作（目标关节角偏移），环境内手写 PD 计算力矩：
+控制：策略输出 12 维动作（目标关节角偏移），PD 力矩计算在 control/pd_controller.py：
     tau = kp * (target - q) - kd * dq
 模拟频率 200 Hz（dt=0.005），控制频率 50 Hz（decimation=4），回合 1000 步 = 20 s。
 """
@@ -14,6 +14,8 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+
+from control.pd_controller import PDController
 
 XML_PATH = Path(__file__).resolve().parent.parent / "robot" / "quadruped.xml"
 
@@ -29,10 +31,6 @@ DEFAULT_DOF_POS = np.array([
 DOF_LOWER = np.array([-0.5, -1.0, -2.9] * 4)
 DOF_UPPER = np.array([0.5, 1.4, 0.0] * 4)
 
-KP = 20.0          # PD 比例增益 (Nm/rad)
-KD = 0.5           # PD 微分增益 (Nm·s/rad)
-TORQUE_LIMIT = 33.5
-ACTION_SCALE = 0.25
 BASE_HEIGHT_TARGET = 0.37   # 默认姿态下躯干中心的标称高度（由 XML 几何算出）
 FALL_HEIGHT = 0.18          # 躯干低于此高度判定摔倒
 COMMAND_RESAMPLE_STEPS = 500  # 每 10 s 重采样一次指令
@@ -95,8 +93,14 @@ class QuadrupedEnv:
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{leg}_foot")
             for leg in ("FL", "FR", "RL", "RR")
         ]
-        self.joint_qpos_adr = 7   # 自由关节占 7 个 qpos
-        self.joint_qvel_adr = 6   # 自由关节占 6 个 qvel
+        # 关节数据在 qpos/qvel 中的起始地址：跳过躯干自由关节（jnt 0）
+        self.joint_qpos_adr = self.model.jnt_qposadr[1]
+        self.joint_qvel_adr = self.model.jnt_dofadr[1]
+
+        # PD 控制器（control/pd_controller.py）：动作 → 目标关节角 → 力矩
+        self.pd = PDController(
+            self.data, DEFAULT_DOF_POS, self.joint_qpos_adr, self.joint_qvel_adr
+        )
 
         # 观测缩放（把不同量纲的量压到相近尺度，legged_gym 惯例）
         self.obs_scales = np.concatenate([
@@ -151,8 +155,8 @@ class QuadrupedEnv:
         self.last_action = self.actions.copy()
         self.actions = action
 
-        # 目标关节角 = 默认姿态 + 缩放后的动作
-        target = DEFAULT_DOF_POS + ACTION_SCALE * action
+        # 动作 → 目标关节角（PD 控制器内部完成）
+        self.pd.set_action(action)
 
         # 随机推一把（指令重采样时 10% 概率，模拟外力干扰）
         if self.randomize and self.command_steps == 0 and self.rng.random() < 0.1:
@@ -160,10 +164,7 @@ class QuadrupedEnv:
 
         self.last_dof_vel = self.data.qvel[self.joint_qvel_adr:].copy()
         for _ in range(self.decimation):
-            q = self.data.qpos[self.joint_qpos_adr:]
-            dq = self.data.qvel[self.joint_qvel_adr:]
-            tau = KP * (target - q) - KD * dq
-            self.data.ctrl[:] = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
+            self.data.ctrl[:] = self.pd.compute_torques()
             mujoco.mj_step(self.model, self.data)
 
         self.step_count += 1
