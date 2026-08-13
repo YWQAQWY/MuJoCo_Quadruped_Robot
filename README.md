@@ -10,9 +10,9 @@ The PPO implementation is adapted from the RL algorithm tutorial repository
 **[YWQAQWY/ReinforcementLearningAlgorithm](https://github.com/YWQAQWY/ReinforcementLearningAlgorithm.git)**:
 
 - `PPO.py` (project root) started from the repository's **discrete-action PPO** (CartPole-v1, softmax + Categorical)
-- It has been converted to a **bounded continuous Gaussian policy** for the quadruped: the actor outputs
-  the mean μ and a learnable log σ, samples are transformed by `tanh`, and PPO log-probabilities include
-  the corresponding Jacobian correction
+- It has been converted to a **continuous Gaussian policy** for the quadruped: the actor outputs the mean μ
+  and a learnable log σ, actions are sampled with `torch.distributions.Normal`, and an entropy bonus
+  (coefficient in `config/train.yaml`) keeps σ from collapsing
 - The repository's `PPO_continuous.py` (continuous PPO for Pendulum-v1) was the reference for this conversion
 
 Core algorithm: PPO-Clip + GAE (Schulman et al. 2015/2017):
@@ -32,7 +32,7 @@ How the trained PPO policy drives the robot, end to end:
   │  PPO policy (runs at 50 Hz in PPO.py)                                  │
   │                                                                        │
   │  obs (45-d) ──► PolicyNet (Gaussian) ──► sample action a ∈ R¹²        │
-  │                [base ang vel, projected  [tanh-bounded to [-1, 1]]     │
+  │                [base ang vel, projected  [clipped to [-1, 1]]          │
   │                 gravity, commands, joint                               │
   │                 pos/vel, previous action]                              │
   └───────────┬──────────────────────────────────────────┬─────────────────┘
@@ -89,11 +89,8 @@ python3 -m venv .venv
 .venv/bin/python tests/smoke_test.py        # random actions don't crash + PD response
 .venv/bin/python tests/zero_action_test.py  # stands for 5 s with zero action
 
-# 3. Train the quadruped with your PPO.py
+# 3. Train the quadruped with PPO.py
 .venv/bin/python scripts/train_ppo.py --iterations 1500 --run-name my_run
-
-# Resume a complete checkpoint (optimizer/RNG/step state are restored)
-.venv/bin/python scripts/train_ppo.py --iterations 1500 --resume runs/my_run/last.pt
 
 # 4. Playback + video + curves
 .venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt --viewer   # live window
@@ -111,16 +108,11 @@ All hyperparameters live in annotated YAML files under `config/`:
 | `config/env.yaml` | simulation timing, command ranges, observation scales/noise, reward weights, termination thresholds, domain randomization |
 | `config/pd.yaml` | PD gains (kp, kd), torque limit, action scale |
 | `config/train.yaml` | PPO hyperparameters (network, lr, epochs, ε, γ, λ) and training-loop settings (iterations, rollout length, seed, save interval, device) |
-| `config/play.yaml` | 回放种子、速度指令脚本、视频尺寸/编码器/相机和 viewer 日志周期 |
-| `config/plot.yaml` | 曲线平滑窗口、画布尺寸、DPI、网格和坐标范围 |
 
-`config.load()` 会在读取时校验关键字段；`config.load_all()` 用于将全部 YAML 配置快照写入 checkpoint。
-训练和回放的常用命令行参数仍可覆盖 YAML，checkpoint 保存的是覆盖后的实际训练配置。
-
-Training writes `last.pt` every iteration and updates `best.pt` only when the fixed-command,
-noise-free evaluation score improves. New checkpoints also contain optimizer state, configuration,
-step counters, and RNG state. Checkpoints created by the previous one-hidden-layer policy are not
-architecture-compatible with the current two-hidden-layer network.
+**Reward / penalty values** are defined in `config/env.yaml` (the `rewards.weights` block plus the
+related thresholds under `rewards:`). The per-term computation and their trigger conditions are
+implemented in `env/quadruped_env.py` (`_compute_reward()`), and each term's live per-step value
+is exposed via `info["reward_components"]` for debugging.
 
 Each entry in the YAML files is annotated with its meaning and unit.
 `scripts/train_ppo.py` reads `config/train.yaml` for defaults; command-line arguments
