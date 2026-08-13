@@ -7,15 +7,16 @@
       → clip(τ, ±torque_limit) → 写入 data.ctrl（XML 中 12 个 <motor> 的力矩）
 
 本模块只负责「角度 → 力矩」，推进物理（mj_step）由环境完成。
+
+超参数（kp/kd/力矩限幅/动作缩放）在 config/pd.yaml。
 """
 from __future__ import annotations
 
 import numpy as np
 
-KP = 20.0            # 比例增益 (Nm/rad)
-KD = 0.5             # 微分增益 (Nm·s/rad)
-TORQUE_LIMIT = 33.5  # 力矩限幅 (Nm)
-ACTION_SCALE = 0.25  # 动作缩放：动作 ±1 对应目标角偏移 ±0.25 rad
+from config import load
+
+PD_CFG = load("pd")  # config/pd.yaml
 
 
 class PDController:
@@ -25,20 +26,21 @@ class PDController:
         default_dof_pos: np.ndarray,
         joint_qpos_adr: int,
         joint_qvel_adr: int,
-        kp: float = KP,
-        kd: float = KD,
-        torque_limit: float = TORQUE_LIMIT,
-        action_scale: float = ACTION_SCALE,
+        kp: float | None = None,
+        kd: float | None = None,
+        torque_limit: float | None = None,
+        action_scale: float | None = None,
     ):
         self.data = data
         self.default_dof_pos = np.asarray(default_dof_pos, dtype=float)
         self.num_joints = len(self.default_dof_pos)
         self.joint_qpos_adr = joint_qpos_adr
         self.joint_qvel_adr = joint_qvel_adr
-        self.kp = kp
-        self.kd = kd
-        self.torque_limit = torque_limit
-        self.action_scale = action_scale
+        # 显式传参优先，否则用 config/pd.yaml 的默认值
+        self.kp = float(PD_CFG["kp"] if kp is None else kp)
+        self.kd = float(PD_CFG["kd"] if kd is None else kd)
+        self.torque_limit = float(PD_CFG["torque_limit"] if torque_limit is None else torque_limit)
+        self.action_scale = float(PD_CFG["action_scale"] if action_scale is None else action_scale)
         self.target = self.default_dof_pos.copy()
 
     def set_action(self, action: np.ndarray) -> np.ndarray:

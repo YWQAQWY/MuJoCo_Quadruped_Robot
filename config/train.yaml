@@ -1,0 +1,22 @@
+# ================= PPO 训练配置 =================
+# scripts/train_ppo.py 使用；命令行参数可以覆盖这里的值（如 --iterations 300）
+
+ppo:                        # 传给 PPO.py 的算法超参数
+  hidden_dim: 256           #   策略/价值网络隐藏层宽度（单隐藏层 MLP）
+  actor_lr: 1.0e-3          #   Actor（策略网络）学习率
+  critic_lr: 1.0e-3         #   Critic（价值网络）学习率
+  epochs: 5                 #   同一条 rollout 重复更新的轮数
+  batch_size: 256           #   小批量大小：每个 epoch 先把 rollout 打乱再切成小批逐批更新
+                            #   （rollout_len 2048 / batch 256 = 每个 epoch 8 次梯度更新）
+  entropy_coef: 0.01        #   熵正则系数：actor loss 减去 entropy_coef × 策略熵，
+                            #   防止高斯 σ 塌缩到 0、保持探索（连续动作必需）
+  eps: 0.2                  #   PPO 裁剪范围 ε（ratio 被裁剪到 [1−ε, 1+ε]）
+  gamma: 0.99               #   折扣因子 γ（TD 目标与 GAE 共用）
+  lmbda: 0.95               #   GAE 参数 λ（λ→0 偏差大方差小，λ→1 偏差小方差大）
+
+training:                   # 训练循环配置
+  iterations: 1500          #   PPO 更新迭代次数（每次迭代采集一条 rollout）
+  rollout_len: 2048         #   每次迭代采集的步数（约 41 s 仿真时间）
+  seed: 1                   #   随机种子（复现实验用）
+  save_every: 50            #   每多少迭代保存一次检查点
+  device: auto              #   训练设备：auto / cuda / cpu

@@ -27,7 +27,7 @@ def parse_args():
     p.add_argument("--output", type=str, default=None, help="视频输出路径（viewer 模式忽略）")
     p.add_argument("--duration", type=float, default=20.0)
     p.add_argument("--fps", type=int, default=50)
-    p.add_argument("--hidden-dim", type=int, default=256)
+    p.add_argument("--hidden-dim", type=int, default=None, help="默认 config/train.yaml（须与训练时一致）")
     return p.parse_args()
 
 
@@ -55,10 +55,14 @@ def command_at(t: float):
 
 def load_agent(env, args):
     import torch
+    from config import load
     from PPO import PPO
 
+    if args.hidden_dim is None:
+        args.hidden_dim = load("train")["ppo"]["hidden_dim"]  # 须与训练时一致
+
     agent = PPO(state_dim=env.obs_dim, hidden_dim=args.hidden_dim, action_dim=env.act_dim,
-                actor_lr=1e-3, critic_lr=1e-3, lmbda=0.95, epoch=5, eps=0.2,
+                actor_lr=1e-3, critic_lr=1e-3, lmbda=0.95, epoch=5, eps=0.2, batch_size=256,
                 actor_gamma=0.99, critic_gamma=0.99, device="cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     agent.actor_net.load_state_dict(ckpt["actor"])
@@ -67,11 +71,8 @@ def load_agent(env, args):
 
 
 def get_action(agent, obs):
-    import torch
-
-    with torch.no_grad():
-        obs_t = torch.tensor([obs], dtype=torch.float)
-        return agent.actor_net(obs_t).squeeze(0).numpy()
+    """确定性动作：直接取高斯均值。"""
+    return agent.take_action(obs, deterministic=True)
 
 
 def run_viewer(args, env, agent):

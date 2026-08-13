@@ -1,5 +1,6 @@
 mujoco==3.11.0
 numpy
+pyyaml
 imageio
 imageio-ffmpeg
 matplotlib

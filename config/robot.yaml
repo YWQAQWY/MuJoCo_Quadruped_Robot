@@ -1,0 +1,16 @@
+# ================= 机器人配置 =================
+# 与 robot/quadruped.xml 的几何和关节定义对应
+
+default_dof_pos:          # 默认站姿（关节顺序 = XML 声明顺序：FL FR RL RR × ab/pitch/knee）
+  [0.1, 0.8, -1.5,        # FL: hip_ab 0.1（足端外撇）/ hip_pitch 0.8（前腿）/ knee -1.5
+   -0.1, 0.8, -1.5,       # FR
+   0.1, 1.0, -1.5,        # RL: hip_pitch 1.0（后腿）
+   -0.1, 1.0, -1.5]       # RR
+# 站姿参照 Unitree A1：支撑多边形前后 0.44 m、左右 0.29 m，零动作可稳定站立
+
+dof_lower: [-0.5, -1.0, -2.9]   # 单腿关节角下限 (rad) ×4 条腿：hip_ab / hip_pitch / knee
+dof_upper: [0.5, 1.4, 0.0]      # 单腿关节角上限 (rad) ×4，与 XML 的 range 一致
+                                # （只用于奖励里的关节限位惩罚，硬限位由 XML 保证）
+
+base_height_target: 0.37        # 默认姿态下躯干中心的标称高度 (m)，由 XML 几何算出
+fall_height: 0.18               # 躯干中心低于此高度判定摔倒 (m)

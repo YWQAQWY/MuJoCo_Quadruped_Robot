@@ -9,10 +9,11 @@ No off-the-shelf RL libraries (stable-baselines3, etc.) are used.
 The PPO implementation is adapted from the RL algorithm tutorial repository
 **[YWQAQWY/ReinforcementLearningAlgorithm](https://github.com/YWQAQWY/ReinforcementLearningAlgorithm.git)**:
 
-- `PPO.py` (project root) is adapted from the repository's **discrete-action PPO** (CartPole-v1, softmax + Categorical)
-- The quadruped is a continuous-control task, so the policy must be changed to a **Gaussian distribution**
-  (actor outputs mean μ + log σ, sampled with `torch.distributions.Normal`)
-- The repository's `PPO_continuous.py` (continuous PPO for Pendulum-v1) serves as the reference for this adaptation
+- `PPO.py` (project root) started from the repository's **discrete-action PPO** (CartPole-v1, softmax + Categorical)
+- It has been converted to a **continuous Gaussian policy** for the quadruped: the actor outputs the mean μ
+  and a learnable log σ, actions are sampled with `torch.distributions.Normal`, and an entropy bonus
+  (coefficient in `config/train.yaml`) keeps σ from collapsing
+- The repository's `PPO_continuous.py` (continuous PPO for Pendulum-v1) was the reference for this conversion
 
 Core algorithm: PPO-Clip + GAE (Schulman et al. 2015/2017):
 
@@ -67,6 +68,7 @@ How the trained PPO policy drives the robot, end to end:
 ```
 PPO.py                      PPO algorithm (adapted from the repository above, continuous version)
 robot/quadruped.xml         Quadruped model (MuJoCo XML, 4 legs × 3 joints = 12 DOF)
+config/                     All hyperparameters, annotated (see below)
 env/quadruped_env.py        Environment: observations, rewards, termination, domain randomization
 control/pd_controller.py    PD joint controller: action → target angles → motor torques
 scripts/train_ppo.py        Training loop (calls PPO.py)
@@ -87,7 +89,7 @@ python3 -m venv .venv
 .venv/bin/python tests/smoke_test.py        # random actions don't crash + PD response
 .venv/bin/python tests/zero_action_test.py  # stands for 5 s with zero action
 
-# 3. Train the quadruped with your own PPO.py (change it to a continuous version first)
+# 3. Train the quadruped with your PPO.py
 .venv/bin/python scripts/train_ppo.py --iterations 1500 --run-name my_run
 
 # 4. Playback + video + curves
@@ -96,16 +98,17 @@ python3 -m venv .venv
 .venv/bin/python scripts/plot_results.py --logs logs/my_run logs/ref_baseline --labels mine baseline
 ```
 
-## Key Hyperparameters
+## Configuration
 
-| Parameter | Value | Notes |
-|---|---|---|
-| Control frequency | 50 Hz | simulation 200 Hz, decimation 4 |
-| γ / λ | 0.99 / 0.95 | discount and GAE |
-| clip ε | 0.2 | PPO clipping range |
-| lr | 1e-3 (linear decay to 0.1× over 1500 iterations) | Adam, eps=1e-5 |
-| epochs × batch | 5 × 256 | rollout 2048 steps per iteration |
-| entropy_coef | 0.01 | exploration |
-| value_coef | 1.0 | value loss weight |
-| max_grad_norm | 1.0 | gradient clipping |
-| PD (kp, kd) | 20, 0.5 | torque limit ±33.5 Nm, action scale 0.25 rad |
+All hyperparameters live in annotated YAML files under `config/`:
+
+| File | Contents |
+|---|---|
+| `config/robot.yaml` | default pose, joint limits, nominal base height, fall height |
+| `config/env.yaml` | simulation timing, command ranges, observation scales/noise, reward weights, termination thresholds, domain randomization |
+| `config/pd.yaml` | PD gains (kp, kd), torque limit, action scale |
+| `config/train.yaml` | PPO hyperparameters (network, lr, epochs, ε, γ, λ) and training-loop settings (iterations, rollout length, seed, save interval, device) |
+
+Each entry in the YAML files is annotated with its meaning and unit.
+`scripts/train_ppo.py` reads `config/train.yaml` for defaults; command-line arguments
+override them for quick experiments (e.g. `--iterations 300`).

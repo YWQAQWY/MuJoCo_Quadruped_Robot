@@ -1,0 +1,7 @@
+# ================= PD 控制器配置 =================
+# control/pd_controller.py 使用：策略动作 → 目标关节角 → 电机力矩
+
+kp: 20.0            # 比例增益 (Nm/rad)：目标角偏差 1 rad 产生 20 Nm 回拉力矩
+kd: 0.5             # 微分增益 (Nm·s/rad)：关节角速度 1 rad/s 产生 0.5 Nm 阻尼力矩
+torque_limit: 33.5  # 力矩限幅 (Nm)，对应 Unitree A1 电机峰值力矩
+action_scale: 0.25  # 动作缩放 (rad)：策略输出 ±1 对应目标角偏移 ±0.25 rad
