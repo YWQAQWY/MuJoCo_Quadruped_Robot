@@ -49,7 +49,17 @@ def test_pd_response():
     print(f"[OK] PD 响应正确：膝误差 0.1 rad → 一步后 {error_after:.4f} rad，力矩为负（回拉）")
 
 
+def test_standing_contacts_are_not_penalized():
+    env = QuadrupedEnv(seed=0, add_noise=False, randomize=False)
+    env.reset()
+    for _ in range(100):
+        _, _, terminated, _, info = env.step(np.zeros(env.act_dim))
+        assert not terminated
+    assert info["reward_components"]["undesired_contact"] == 0.0
+
+
 if __name__ == "__main__":
     test_shapes_and_random_steps()
     test_pd_response()
+    test_standing_contacts_are_not_penalized()
     print("全部通过")

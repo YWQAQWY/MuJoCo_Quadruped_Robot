@@ -19,18 +19,17 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from config import load
+from config import PROJECT_DIR, load
 from control.pd_controller import PDController
-
-XML_PATH = Path(__file__).resolve().parent.parent / "robot" / "quadruped.xml"
 
 ROBOT_CFG = load("robot")   # config/robot.yaml
 ENV_CFG = load("env")       # config/env.yaml
+XML_PATH = PROJECT_DIR / ROBOT_CFG["xml_path"]
 
 # 导出常用量（供测试和脚本使用），内容来自 config/robot.yaml
 DEFAULT_DOF_POS = np.array(ROBOT_CFG["default_dof_pos"], dtype=float)
-DOF_LOWER = np.array(ROBOT_CFG["dof_lower"] * 4, dtype=float)
-DOF_UPPER = np.array(ROBOT_CFG["dof_upper"] * 4, dtype=float)
+DOF_LOWER = np.tile(ROBOT_CFG["dof_lower"], len(ROBOT_CFG["leg_names"])).astype(float)
+DOF_UPPER = np.tile(ROBOT_CFG["dof_upper"], len(ROBOT_CFG["leg_names"])).astype(float)
 
 
 def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -79,19 +78,27 @@ class QuadrupedEnv:
         self.command_override = command_override
         self.dt = self.model.opt.timestep * self.decimation  # 控制周期 0.02 s
 
-        self.obs_dim = 45
-        self.act_dim = 12
-        self.num_joints = 12
+        self.num_joints = len(DEFAULT_DOF_POS)
+        self.act_dim = self.num_joints
+        self.obs_dim = 3 + 3 + 3 + 3 * self.num_joints
         self.step_count = 0
 
         # 运动学/动力学索引
-        self.torso_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "torso")
-        self.torso_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "torso")
-        self.floor_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self.torso_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, ROBOT_CFG["torso_body_name"])
+        self.torso_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, ROBOT_CFG["torso_geom_name"])
+        self.floor_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, ROBOT_CFG["floor_geom_name"])
         self.foot_geom_ids = [
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{leg}_foot")
-            for leg in ("FL", "FR", "RL", "RR")
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                              f"{leg}{ROBOT_CFG['foot_geom_suffix']}")
+            for leg in ROBOT_CFG["leg_names"]
         ]
+        self.foot_body_ids = [int(self.model.geom_bodyid[gid]) for gid in self.foot_geom_ids]
+        self._base_body_mass = self.model.body_mass.copy()
+        self._base_body_inertia = self.model.body_inertia.copy()
+        self._base_kp = self.pd.kp if hasattr(self, "pd") else None
         # 关节数据在 qpos/qvel 中的起始地址：跳过躯干自由关节（jnt 0）
         self.joint_qpos_adr = self.model.jnt_qposadr[1]
         self.joint_qvel_adr = self.model.jnt_dofadr[1]
@@ -100,6 +107,8 @@ class QuadrupedEnv:
         self.pd = PDController(
             self.data, DEFAULT_DOF_POS, self.joint_qpos_adr, self.joint_qvel_adr
         )
+        self._base_kp = self.pd.kp
+        self._base_kd = self.pd.kd
 
         # 观测缩放（config/env.yaml → observation.scales）
         osc = self.cfg["observation"]["scales"]
@@ -107,9 +116,9 @@ class QuadrupedEnv:
             np.array([osc["base_ang_vel"]] * 3),        # base 角速度 (rad/s)
             np.array([osc["projected_gravity"]] * 3),   # 投影重力
             np.array(osc["commands"]),                  # 指令 vx, vy, yaw
-            np.array([osc["dof_pos"]] * 12),            # 关节角 - 默认值
-            np.array([osc["dof_vel"]] * 12),            # 关节角速度
-            np.array([osc["actions"]] * 12),            # 上一步动作
+            np.full(self.num_joints, osc["dof_pos"]),   # 关节角 - 默认值
+            np.full(self.num_joints, osc["dof_vel"]),   # 关节角速度
+            np.full(self.num_joints, osc["actions"]),   # 上一步动作
         ])
         self.obs_noise_std = self.cfg["observation"]["noise"]
 
@@ -118,9 +127,11 @@ class QuadrupedEnv:
         self.last_action = np.zeros(self.act_dim)
         self.last_dof_vel = np.zeros(self.num_joints)
         self.command_steps = 0
+        self.action_delay = 0
+        self.action_buffer = []
 
         # 每回合随机化的摩擦系数（评估时不随机化）
-        self.foot_friction = np.full(4, 1.0)
+        self.foot_friction = np.full(len(self.foot_geom_ids), 1.0)
 
     # ------------------------------------------------------------------ #
     # 对外接口
@@ -135,22 +146,28 @@ class QuadrupedEnv:
         pos_range = init_cfg["pos_range"]
         self.data.qpos[0] = float(self.rng.uniform(*pos_range))
         self.data.qpos[1] = float(self.rng.uniform(*pos_range))
-        self.data.qpos[2] = float(ROBOT_CFG["base_height_target"] + 0.01
+        self.data.qpos[2] = float(ROBOT_CFG["base_height_target"] + init_cfg["base_height_offset"]
                                   + self.rng.uniform(-init_cfg["z_noise"], init_cfg["z_noise"]))
         rpy = self.rng.uniform(-init_cfg["rpy_noise"], init_cfg["rpy_noise"], 3) \
             if self.randomize else np.zeros(3)
         self.data.qpos[3:7] = self._rpy_to_quat(rpy)
-        dof_noise = self.rng.uniform(-init_cfg["dof_pos_noise"], init_cfg["dof_pos_noise"], 12) \
-            if self.randomize else np.zeros(12)
+        dof_noise = self.rng.uniform(-init_cfg["dof_pos_noise"], init_cfg["dof_pos_noise"],
+                                     self.num_joints) \
+            if self.randomize else np.zeros(self.num_joints)
         self.data.qpos[self.joint_qpos_adr:] = DEFAULT_DOF_POS + dof_noise
         self.data.qvel[:] = 0.0
 
         self.actions[:] = 0.0
         self.last_action[:] = 0.0
         self.last_dof_vel[:] = 0.0
+        self.pd.target = DEFAULT_DOF_POS.copy()
+        self.action_buffer = []
 
         if self.randomize:
             self._randomize_friction()
+            self._randomize_dynamics()
+        else:
+            self._restore_dynamics()
         self._resample_commands(first=True)
 
         mujoco.mj_forward(self.model, self.data)
@@ -158,6 +175,11 @@ class QuadrupedEnv:
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -1.0, 1.0)
+        self.action_buffer.append(action.copy())
+        if len(self.action_buffer) <= self.action_delay:
+            action = np.zeros_like(action)
+        else:
+            action = self.action_buffer.pop(0)
         self.last_action = self.actions.copy()
         self.actions = action
 
@@ -226,9 +248,9 @@ class QuadrupedEnv:
                 self.rng.normal(0.0, n["base_ang_vel"], 3),
                 self.rng.normal(0.0, n["projected_gravity"], 3),
                 np.zeros(3),                        # 指令不加噪
-                self.rng.normal(0.0, n["dof_pos"], 12),
-                self.rng.normal(0.0, n["dof_vel"], 12),
-                np.zeros(12),                       # 动作不加噪
+                self.rng.normal(0.0, n["dof_pos"], self.num_joints),
+                self.rng.normal(0.0, n["dof_vel"], self.num_joints),
+                np.zeros(self.num_joints),          # 动作不加噪
             ])
             obs += noise
         return obs.astype(np.float32)
@@ -264,6 +286,25 @@ class QuadrupedEnv:
         violation = np.maximum(0.0, (DOF_LOWER + margin) - q_joint) + \
                     np.maximum(0.0, q_joint - (DOF_UPPER - margin))
 
+        foot_contacts = set()
+        undesired_contacts = 0
+        foot_set = set(self.foot_geom_ids)
+        for contact in self.data.contact:
+            pair = {contact.geom1, contact.geom2}
+            if self.floor_geom_id not in pair:
+                continue
+            other = next(iter(pair - {self.floor_geom_id}))
+            # 足球和同一末端 body 上的小腿胶囊会同时产生地面接触，均视为合法支撑。
+            if other in foot_set or int(self.model.geom_bodyid[other]) in self.foot_body_ids:
+                foot_contacts.add(other)
+            elif other != self.torso_geom_id:
+                undesired_contacts += 1
+        feet_slip = 0.0
+        for geom_id in foot_contacts:
+            body_id = int(self.model.geom_bodyid[geom_id])
+            feet_slip += float(np.sum(self.data.cvel[body_id, 3:5] ** 2))
+        command_norm = float(np.linalg.norm(self.commands))
+
         w = r_cfg["weights"]
         components = {
             "lin_vel": w["lin_vel"] * r_lin_vel,
@@ -276,6 +317,11 @@ class QuadrupedEnv:
             "torque": w["torque"] * float(np.sum(torques ** 2)),
             "dof_acc": w["dof_acc"] * float(np.sum(dof_acc ** 2)),
             "joint_limit": w["joint_limit"] * float(np.sum(violation ** 2)),
+            "power": w["power"] * float(np.sum(np.abs(torques * dof_vel))),
+            "feet_slip": w["feet_slip"] * feet_slip,
+            "undesired_contact": w["undesired_contact"] * undesired_contacts,
+            "stand_pose": w["stand_pose"] * float(np.sum((q_joint - DEFAULT_DOF_POS) ** 2))
+                          if command_norm < r_cfg["stand_command_threshold"] else 0.0,
             "termination": w["termination"] if terminated else 0.0,
         }
         return float(sum(components.values())), components
@@ -320,6 +366,24 @@ class QuadrupedEnv:
         self.foot_friction[:] = friction
         for gid in self.foot_geom_ids:
             self.model.geom_friction[gid, 0] = friction
+
+    def _restore_dynamics(self):
+        self.model.body_mass[:] = self._base_body_mass
+        self.model.body_inertia[:] = self._base_body_inertia
+        self.pd.kp = self._base_kp
+        self.pd.kd = self._base_kd
+        self.action_delay = 0
+
+    def _randomize_dynamics(self):
+        cfg = self.cfg["domain_randomization"]
+        mass_scale = float(self.rng.uniform(*cfg["mass_scale_range"]))
+        self.model.body_mass[:] = self._base_body_mass * mass_scale
+        self.model.body_inertia[:] = self._base_body_inertia * mass_scale
+        gain_scale = float(self.rng.uniform(*cfg["pd_gain_scale_range"]))
+        self.pd.kp = self._base_kp * gain_scale
+        self.pd.kd = self._base_kd * gain_scale
+        lo, hi = cfg["action_delay_steps"]
+        self.action_delay = int(self.rng.integers(lo, hi + 1))
 
     def _apply_push(self):
         """对基座施加一次随机水平速度脉冲。"""

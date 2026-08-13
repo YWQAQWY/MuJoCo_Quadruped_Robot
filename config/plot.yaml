@@ -1,0 +1,6 @@
+# ================= 训练曲线配置 =================
+window: 50
+figure_size: [14, 8]
+dpi: 120
+grid_alpha: 0.3
+explained_variance_ylim: [-1.0, 1.1]

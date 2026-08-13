@@ -2,8 +2,15 @@
 # scripts/train_ppo.py 使用；命令行参数可以覆盖这里的值（如 --iterations 300）
 
 ppo:                        # 传给 PPO.py 的算法超参数
-  hidden_dim: 256           #   策略/价值网络隐藏层宽度（单隐藏层 MLP）
-  actor_lr: 1.0e-3          #   Actor（策略网络）学习率
+  hidden_dims: [256, 256]   #   策略/价值网络各隐藏层宽度
+  activation: elu           #   relu / elu / tanh
+  hidden_init_gain: 1.41421356237
+  actor_output_gain: 0.01
+  critic_output_gain: 1.0
+  initial_log_std: -1.0
+  log_std_bounds: [-5.0, 2.0]
+  numerical_epsilon: 1.0e-6 #   tanh log-prob 与归一化数值稳定项
+  actor_lr: 3.0e-4          #   Actor（策略网络）学习率
   critic_lr: 1.0e-3         #   Critic（价值网络）学习率
   epochs: 5                 #   同一条 rollout 重复更新的轮数
   batch_size: 256           #   小批量大小：每个 epoch 先把 rollout 打乱再切成小批逐批更新
@@ -13,6 +20,10 @@ ppo:                        # 传给 PPO.py 的算法超参数
   eps: 0.2                  #   PPO 裁剪范围 ε（ratio 被裁剪到 [1−ε, 1+ε]）
   gamma: 0.99               #   折扣因子 γ（TD 目标与 GAE 共用）
   lmbda: 0.95               #   GAE 参数 λ（λ→0 偏差大方差小，λ→1 偏差小方差大）
+  value_coef: 0.5           #   value loss 系数
+  value_clip: 0.2           #   critic value clipping 范围
+  max_grad_norm: 0.5        #   Actor/Critic 梯度范数上限
+  target_kl: 0.02           #   超过目标 KL 时提前结束本轮 PPO epochs
 
 training:                   # 训练循环配置
   iterations: 1500          #   PPO 更新迭代次数（每次迭代采集一条 rollout）
@@ -20,3 +31,26 @@ training:                   # 训练循环配置
   seed: 1                   #   随机种子（复现实验用）
   save_every: 50            #   每多少迭代保存一次检查点
   device: auto              #   训练设备：auto / cuda / cpu
+  lr_anneal: true           #   训练过程中将学习率线性退火到 0
+  checkpoint_every_iteration: true
+  environment:
+    add_noise: true
+    randomize: true
+    command_override: false
+
+evaluation:
+  every: 50
+  episodes: 3
+  episode_length: 500
+  seed_offset: 10000
+  deterministic: true
+  add_noise: false
+  randomize: false
+  command_override: true
+  commands:
+    - [0.0, 0.0, 0.0]
+    - [0.8, 0.0, 0.0]
+    - [0.4, 0.3, 0.5]
+
+logging:
+  print_every: 10

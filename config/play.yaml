@@ -1,0 +1,27 @@
+# ================= 回放与视频配置 =================
+seed: 0
+deterministic: true
+add_noise: false
+randomize: false
+command_override: true
+duration: 20.0
+fps: 50
+viewer_log_every_steps: 50
+viewer_close_poll_seconds: 0.01
+viewer_close_grace_seconds: 0.05
+
+video:
+  width: 640
+  height: 480
+  codec: libx264
+  camera: track
+  mujoco_gl: egl
+
+# [持续时间(s), [vx, vy, yaw_rate]]
+command_script:
+  - [2.0, [0.0, 0.0, 0.0]]
+  - [4.0, [0.8, 0.0, 0.0]]
+  - [4.0, [0.5, 0.4, 0.0]]
+  - [4.0, [0.0, 0.0, 0.8]]
+  - [4.0, [0.5, 0.0, 0.0]]
+  - [2.0, [0.0, 0.0, 0.0]]

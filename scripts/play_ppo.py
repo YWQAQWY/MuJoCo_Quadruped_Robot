@@ -19,52 +19,58 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from config import load  # noqa: E402
+
+PLAY_CFG = load("play")
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="回放你自己的 PPO 四足狗策略")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--viewer", action="store_true", help="打开实时可视化窗口（默认录视频）")
     p.add_argument("--output", type=str, default=None, help="视频输出路径（viewer 模式忽略）")
-    p.add_argument("--duration", type=float, default=20.0)
-    p.add_argument("--fps", type=int, default=50)
+    p.add_argument("--duration", type=float, default=None, help="默认 config/play.yaml")
+    p.add_argument("--fps", type=int, default=None, help="默认 config/play.yaml")
     p.add_argument("--hidden-dim", type=int, default=None, help="默认 config/train.yaml（须与训练时一致）")
     return p.parse_args()
 
 
-# (时长 s, (vx, vy, yaw_rate))
-COMMAND_SCRIPT = [
-    (2.0, (0.0, 0.0, 0.0)),
-    (4.0, (0.8, 0.0, 0.0)),
-    (4.0, (0.5, 0.4, 0.0)),
-    (4.0, (0.0, 0.0, 0.8)),
-    (4.0, (0.5, 0.0, 0.0)),
-    (2.0, (0.0, 0.0, 0.0)),
-]
-
-
 def command_at(t: float):
-    total = sum(d for d, _ in COMMAND_SCRIPT)
+    command_script = PLAY_CFG["command_script"]
+    total = sum(d for d, _ in command_script)
     t = t % total
     acc = 0.0
-    for dur, cmd in COMMAND_SCRIPT:
+    for dur, cmd in command_script:
         if t < acc + dur:
             return cmd
         acc += dur
-    return COMMAND_SCRIPT[-1][1]
+    return command_script[-1][1]
 
 
 def load_agent(env, args):
     import torch
-    from config import load
     from PPO import PPO
 
-    if args.hidden_dim is None:
-        args.hidden_dim = load("train")["ppo"]["hidden_dim"]  # 须与训练时一致
-
-    agent = PPO(state_dim=env.obs_dim, hidden_dim=args.hidden_dim, action_dim=env.act_dim,
-                actor_lr=1e-3, critic_lr=1e-3, lmbda=0.95, epoch=5, eps=0.2, batch_size=256,
-                actor_gamma=0.99, critic_gamma=0.99, device="cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    saved_config = ckpt.get("config", {})
+    saved_train = saved_config.get("train", saved_config)
+    ppo_cfg = saved_train.get("ppo", load("train")["ppo"])
+    hidden_dims = ([args.hidden_dim, args.hidden_dim] if args.hidden_dim is not None
+                   else ppo_cfg["hidden_dims"])
+    agent = PPO(
+        state_dim=env.obs_dim, hidden_dim=hidden_dims[0], hidden_dims=hidden_dims,
+        action_dim=env.act_dim, actor_lr=ppo_cfg["actor_lr"], critic_lr=ppo_cfg["critic_lr"],
+        lmbda=ppo_cfg["lmbda"], epoch=ppo_cfg["epochs"], eps=ppo_cfg["eps"],
+        batch_size=ppo_cfg["batch_size"], actor_gamma=ppo_cfg["gamma"],
+        critic_gamma=ppo_cfg["gamma"], entropy_coef=ppo_cfg["entropy_coef"],
+        value_coef=ppo_cfg["value_coef"], value_clip=ppo_cfg["value_clip"],
+        max_grad_norm=ppo_cfg["max_grad_norm"], target_kl=ppo_cfg["target_kl"],
+        activation=ppo_cfg["activation"], hidden_init_gain=ppo_cfg["hidden_init_gain"],
+        actor_output_gain=ppo_cfg["actor_output_gain"],
+        critic_output_gain=ppo_cfg["critic_output_gain"],
+        initial_log_std=ppo_cfg["initial_log_std"], log_std_bounds=ppo_cfg["log_std_bounds"],
+        numerical_epsilon=ppo_cfg["numerical_epsilon"], device="cpu",
+    )
     agent.actor_net.load_state_dict(ckpt["actor"])
     agent.actor_net.eval()
     return agent
@@ -72,7 +78,7 @@ def load_agent(env, args):
 
 def get_action(agent, obs):
     """确定性动作：直接取高斯均值。"""
-    return agent.take_action(obs, deterministic=True)
+    return agent.take_action(obs, deterministic=PLAY_CFG["deterministic"])
 
 
 def run_viewer(args, env, agent):
@@ -96,10 +102,10 @@ def run_viewer(args, env, agent):
         obs, _, terminated, truncated, info = env.step(action)
         viewer.sync()
 
-        if terminated:
-            print(f"t={t:.1f}s 机器人摔倒，自动重置")
+        if terminated or truncated:
+            print(f"t={t:.1f}s 回合结束，自动重置")
             obs, _ = env.reset()
-        if step % 50 == 0:
+        if step % PLAY_CFG["viewer_log_every_steps"] == 0:
             print(f"t={t:5.1f}s  指令=({info['commands'][0]:+.2f}, {info['commands'][1]:+.2f}, "
                   f"{info['commands'][2]:+.2f})")
 
@@ -111,8 +117,8 @@ def run_viewer(args, env, agent):
     # 关闭窗口后等 viewer 线程完全退出，避免退出时 glfw 销毁竞争导致段错误
     viewer.close()
     while viewer.is_running():
-        time.sleep(0.01)
-    time.sleep(0.05)
+        time.sleep(PLAY_CFG["viewer_close_poll_seconds"])
+    time.sleep(PLAY_CFG["viewer_close_grace_seconds"])
 
 
 def _on_key(key, env):
@@ -123,7 +129,7 @@ def _on_key(key, env):
 def record_video(args, env, agent):
     import os
 
-    os.environ.setdefault("MUJOCO_GL", "egl")  # 无头渲染后端
+    os.environ.setdefault("MUJOCO_GL", PLAY_CFG["video"]["mujoco_gl"])
 
     import imageio
     import mujoco
@@ -133,8 +139,9 @@ def record_video(args, env, agent):
         ROOT / "videos" / f"{ckpt_path.parent.name}_{ckpt_path.stem}.mp4"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    renderer = mujoco.Renderer(env.model, height=480, width=640)
-    writer = imageio.get_writer(out_path, fps=args.fps, codec="libx264")
+    video_cfg = PLAY_CFG["video"]
+    renderer = mujoco.Renderer(env.model, height=video_cfg["height"], width=video_cfg["width"])
+    writer = imageio.get_writer(out_path, fps=args.fps, codec=video_cfg["codec"])
 
     obs, _ = env.reset()
     total_steps = int(args.duration * args.fps)
@@ -146,11 +153,11 @@ def record_video(args, env, agent):
         action = get_action(agent, obs)
         obs, _, terminated, truncated, info = env.step(action)
 
-        renderer.update_scene(env.data, camera="track")
+        renderer.update_scene(env.data, camera=video_cfg["camera"])
         writer.append_data(renderer.render())
 
-        if terminated:
-            print(f"t={t:.1f}s 机器人摔倒，重置")
+        if terminated or truncated:
+            print(f"t={t:.1f}s 回合结束，重置")
             obs, _ = env.reset()
 
         if step % args.fps == 0:
@@ -167,10 +174,14 @@ def record_video(args, env, agent):
 
 def main():
     args = parse_args()
+    args.duration = PLAY_CFG["duration"] if args.duration is None else args.duration
+    args.fps = PLAY_CFG["fps"] if args.fps is None else args.fps
 
     from env.quadruped_env import QuadrupedEnv
 
-    env = QuadrupedEnv(seed=0, add_noise=False, randomize=False, command_override=True)
+    env = QuadrupedEnv(seed=PLAY_CFG["seed"], add_noise=PLAY_CFG["add_noise"],
+                       randomize=PLAY_CFG["randomize"],
+                       command_override=PLAY_CFG["command_override"])
     agent = load_agent(env, args)
     print(f"已加载 {args.checkpoint}")
 

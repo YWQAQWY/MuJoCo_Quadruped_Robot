@@ -1,6 +1,13 @@
 # ================= 机器人配置 =================
 # 与 robot/quadruped.xml 的几何和关节定义对应
 
+xml_path: robot/quadruped.xml
+torso_body_name: torso
+torso_geom_name: torso
+floor_geom_name: floor
+leg_names: [FL, FR, RL, RR]
+foot_geom_suffix: _foot
+
 default_dof_pos:          # 默认站姿（关节顺序 = XML 声明顺序：FL FR RL RR × ab/pitch/knee）
   [0.1, 0.8, -1.5,        # FL: hip_ab 0.1（足端外撇）/ hip_pitch 0.8（前腿）/ knee -1.5
    -0.1, 0.8, -1.5,       # FR

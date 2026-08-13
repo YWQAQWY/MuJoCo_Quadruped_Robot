@@ -1,8 +1,8 @@
 mujoco==3.11.0
-numpy
-pyyaml
-imageio
-imageio-ffmpeg
-matplotlib
+numpy==2.2.6
+pyyaml==6.0.3
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+matplotlib==3.10.9
 # torch 需要从 PyTorch 官方索引安装 CUDA 版本：
 #   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
