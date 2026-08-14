@@ -8,7 +8,7 @@ PPO.py 是连续动作版本（高斯策略 + 熵正则）。
 接口要求：
     agent = PPO(state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
                 lmbda, epoch, eps, batch_size, actor_gamma, critic_gamma, device)
-    action = agent.take_action(obs)          # obs: [45] numpy -> action: [12] numpy
+    action = agent.take_action(obs)          # obs: [48] numpy -> action: [12] numpy
     agent.update(transition_dict)            # 见下方 rollout 采集格式
 """
 from __future__ import annotations
@@ -54,7 +54,7 @@ def parse_args():
     return p.parse_args()
 
 
-def make_checkpoint(agent, iteration, total_steps, best_eval_reward, config):
+def make_checkpoint(agent, iteration, total_steps, best_eval_score, config):
     return {
         "actor": agent.actor_net.state_dict(),
         "critic": agent.critic_net.state_dict(),
@@ -62,7 +62,7 @@ def make_checkpoint(agent, iteration, total_steps, best_eval_reward, config):
         "critic_optimizer": agent.critic_optimizer.state_dict(),
         "iteration": iteration,
         "total_steps": total_steps,
-        "best_eval_reward": best_eval_reward,
+        "best_eval_score": best_eval_score,
         "config": config,
         "rng": {
             "python": random.getstate(),
@@ -73,27 +73,68 @@ def make_checkpoint(agent, iteration, total_steps, best_eval_reward, config):
 
 
 def evaluate(agent, seed, eval_cfg):
-    """用固定指令和无噪声环境评估，返回完整回合平均奖励/长度。"""
+    """固定指令评估；显式衡量跟踪误差，避免把稳定站立选为 best。"""
     commands = eval_cfg["commands"]
     episode_length = eval_cfg["episode_length"]
     env = QuadrupedEnv(seed=seed, episode_length=episode_length,
                        add_noise=eval_cfg["add_noise"], randomize=eval_cfg["randomize"],
                        command_override=eval_cfg["command_override"])
-    rewards, lengths = [], []
+    rewards, lengths, lin_errors, yaw_errors, successes = [], [], [], [], []
+    falls = 0
     for ep in range(eval_cfg["episodes"]):
         obs, _ = env.reset()
         env.set_commands(*commands[ep % len(commands)])
         total = 0.0
+        episode_lin_errors, episode_yaw_errors = [], []
         for step in range(episode_length):
-            obs, reward, terminated, truncated, _ = env.step(
+            obs, reward, terminated, truncated, info = env.step(
                 agent.take_action(obs, deterministic=eval_cfg["deterministic"])
             )
             total += reward
+            lin_error = float(np.linalg.norm(np.asarray(env.commands[:2]) - info["base_lin_vel"][:2]))
+            yaw_error = float(abs(env.commands[2] - info["base_ang_vel"][2]))
+            episode_lin_errors.append(lin_error)
+            episode_yaw_errors.append(yaw_error)
             if terminated or truncated:
                 break
+        falls += int(terminated)
         rewards.append(total)
         lengths.append(step + 1)
-    return float(np.mean(rewards)), float(np.mean(lengths))
+        lin_errors.extend(episode_lin_errors)
+        yaw_errors.extend(episode_yaw_errors)
+        score_cfg = eval_cfg["best_score"]
+        successes.append(float(
+            np.mean(episode_lin_errors) < score_cfg["linear_error_success_threshold"] and
+            np.mean(episode_yaw_errors) < score_cfg["yaw_error_success_threshold"] and
+            not terminated
+        ))
+    survival_rate = 1.0 - falls / eval_cfg["episodes"]
+    mean_lin_error = float(np.mean(lin_errors))
+    mean_yaw_error = float(np.mean(yaw_errors))
+    score_cfg = eval_cfg["best_score"]
+    tracking_score = (-score_cfg["tracking_error_weight"] *
+                      (mean_lin_error + mean_yaw_error)
+                      - score_cfg["fall_penalty"] * (1.0 - survival_rate))
+    return {
+        "reward": float(np.mean(rewards)), "episode_length": float(np.mean(lengths)),
+        "linear_error": mean_lin_error, "yaw_error": mean_yaw_error,
+        "survival_rate": survival_rate, "success_rate": float(np.mean(successes)),
+        "score": tracking_score,
+    }
+
+
+def curriculum_scales(iteration, iterations, cfg):
+    """将训练进度映射为指令范围和域随机化强度。"""
+    if not cfg["enabled"]:
+        return 1.0, 1.0
+    progress = iteration / max(1, iterations - 1)
+    span = max(1e-8, cfg["end_fraction"] - cfg["start_fraction"])
+    alpha = float(np.clip((progress - cfg["start_fraction"]) / span, 0.0, 1.0))
+    command_scale = cfg["command_scale_start"] + alpha * (1.0 - cfg["command_scale_start"])
+    randomization_scale = cfg["randomization_scale_start"] + alpha * (
+        1.0 - cfg["randomization_scale_start"]
+    )
+    return command_scale, randomization_scale
 
 
 def main():
@@ -102,6 +143,7 @@ def main():
     tr_cfg = TRAIN_CFG["training"]
     eval_cfg = TRAIN_CFG["evaluation"]
     log_cfg = TRAIN_CFG["logging"]
+    curriculum_cfg = TRAIN_CFG["curriculum"]
 
     def cfg(cli_val, key):
         """命令行参数优先，缺省用 config/train.yaml 的 training 段。"""
@@ -175,7 +217,7 @@ def main():
 
     start_iteration = 0
     total_steps = 0
-    best_eval_reward = -float("inf")
+    best_eval_score = -float("inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         agent.actor_net.load_state_dict(checkpoint["actor"])
@@ -184,7 +226,8 @@ def main():
         agent.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         start_iteration = int(checkpoint["iteration"]) + 1
         total_steps = int(checkpoint.get("total_steps", start_iteration * rollout_len))
-        best_eval_reward = float(checkpoint.get("best_eval_reward", -float("inf")))
+        best_eval_score = float(checkpoint.get(
+            "best_eval_score", checkpoint.get("best_eval_reward", -float("inf"))))
         if "rng" in checkpoint:
             random.setstate(checkpoint["rng"]["python"])
             np.random.set_state(checkpoint["rng"]["numpy"])
@@ -198,13 +241,22 @@ def main():
         writer.writerow(["iteration", "total_steps", "mean_ep_reward", "mean_ep_len",
                          "policy_loss", "value_loss", "entropy", "approx_kl",
                          "clip_fraction", "explained_var", "action_std", "eval_reward",
-                         "eval_ep_len", "actor_lr", "fps"])
+                         "eval_ep_len", "eval_linear_error", "eval_yaw_error",
+                         "eval_survival_rate", "eval_success_rate", "eval_score",
+                         "actor_lr", "command_scale",
+                         "randomization_scale", "fps"])
 
     print(f"运行目录: runs/{run_name}   设备: {device}   每次迭代 {rollout_len} 步")
 
+    command_scale, randomization_scale = curriculum_scales(
+        start_iteration, iterations, curriculum_cfg
+    )
+    env.set_curriculum(command_scale, randomization_scale)
     obs, _ = env.reset()
     ep_reward, ep_len = 0.0, 0
     for it in range(start_iteration, iterations):
+        command_scale, randomization_scale = curriculum_scales(it, iterations, curriculum_cfg)
+        env.set_curriculum(command_scale, randomization_scale)
         # ---- 采集 rollout（格式与你在 CartPole 里用的一致） ----
         transition_dict = {
             "states": [], "actions": [], "next_states": [],
@@ -240,8 +292,12 @@ def main():
 
         if tr_cfg.get("lr_anneal", True):
             fraction = max(0.0, 1.0 - (it + 1) / iterations)
-            agent.actor_optimizer.param_groups[0]["lr"] = actor_lr * fraction
-            agent.critic_optimizer.param_groups[0]["lr"] = critic_lr * fraction
+            agent.actor_optimizer.param_groups[0]["lr"] = (
+                tr_cfg["min_actor_lr"] + fraction * (actor_lr - tr_cfg["min_actor_lr"])
+            )
+            agent.critic_optimizer.param_groups[0]["lr"] = (
+                tr_cfg["min_critic_lr"] + fraction * (critic_lr - tr_cfg["min_critic_lr"])
+            )
 
         # ---- 记录 ----
         mean_ep_reward = float(np.mean(ep_rewards)) if ep_rewards else float("nan")
@@ -249,16 +305,24 @@ def main():
         fps = rollout_len / (time.time() - t_start)
         eval_reward = float("nan")
         eval_ep_len = float("nan")
+        eval_metrics = {key: float("nan") for key in (
+            "linear_error", "yaw_error", "survival_rate", "success_rate", "score")}
         should_eval = (it + 1) % eval_cfg["every"] == 0 or it == iterations - 1
         if should_eval:
-            eval_reward, eval_ep_len = evaluate(agent, seed + eval_cfg["seed_offset"], eval_cfg)
+            eval_metrics = evaluate(agent, seed + eval_cfg["seed_offset"], eval_cfg)
+            eval_reward = eval_metrics["reward"]
+            eval_ep_len = eval_metrics["episode_length"]
         writer.writerow([
             it, total_steps, f"{mean_ep_reward:.3f}", f"{mean_ep_len:.1f}",
             f"{metrics['policy_loss']:.6f}", f"{metrics['value_loss']:.6f}",
             f"{metrics['entropy']:.6f}", f"{metrics['approx_kl']:.6f}",
             f"{metrics['clip_fraction']:.6f}", f"{metrics['explained_var']:.6f}",
             f"{metrics['action_std']:.6f}", f"{eval_reward:.3f}", f"{eval_ep_len:.1f}",
-            f"{agent.actor_optimizer.param_groups[0]['lr']:.8f}", f"{fps:.1f}",
+            f"{eval_metrics['linear_error']:.5f}", f"{eval_metrics['yaw_error']:.5f}",
+            f"{eval_metrics['survival_rate']:.4f}", f"{eval_metrics['success_rate']:.4f}",
+            f"{eval_metrics['score']:.4f}",
+            f"{agent.actor_optimizer.param_groups[0]['lr']:.8f}",
+            f"{command_scale:.4f}", f"{randomization_scale:.4f}", f"{fps:.1f}",
         ])
         csv_file.flush()
 
@@ -266,10 +330,12 @@ def main():
             print(f"iter {it:5d} | 平均回合奖励 {mean_ep_reward:8.2f} | "
                   f"回合长度 {mean_ep_len:6.1f} | {fps:6.0f} fps")
 
-        is_new_best = should_eval and eval_reward > best_eval_reward
+        eligible = (should_eval and eval_metrics["survival_rate"] >=
+                    eval_cfg["best_score"]["minimum_survival_rate"])
+        is_new_best = eligible and eval_metrics["score"] > best_eval_score
         if is_new_best:
-            best_eval_reward = eval_reward
-        checkpoint = make_checkpoint(agent, it, total_steps, best_eval_reward, effective_config)
+            best_eval_score = eval_metrics["score"]
+        checkpoint = make_checkpoint(agent, it, total_steps, best_eval_score, effective_config)
         if (it + 1) % save_every == 0:
             torch.save(checkpoint, run_dir / f"checkpoint_{it + 1}.pt")
         if tr_cfg["checkpoint_every_iteration"] or it == iterations - 1:

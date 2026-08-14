@@ -10,6 +10,22 @@ viewer_log_every_steps: 50
 viewer_close_poll_seconds: 0.01
 viewer_close_grace_seconds: 0.05
 
+keyboard:
+  linear_step: 0.1          # 每次按键改变线速度 (m/s)
+  yaw_step: 0.1             # 每次按键改变角速度 (rad/s)
+  max_vx: 1.0
+  max_vy: 0.6
+  max_yaw_rate: 1.0
+  keys:
+    forward: w
+    backward: s
+    left: a
+    right: d
+    yaw_left: q
+    yaw_right: e
+    stop: space
+    reset: r
+
 video:
   width: 640
   height: 480

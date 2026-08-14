@@ -10,9 +10,9 @@ The PPO implementation is adapted from the RL algorithm tutorial repository
 **[YWQAQWY/ReinforcementLearningAlgorithm](https://github.com/YWQAQWY/ReinforcementLearningAlgorithm.git)**:
 
 - `PPO.py` (project root) started from the repository's **discrete-action PPO** (CartPole-v1, softmax + Categorical)
-- It has been converted to a **continuous Gaussian policy** for the quadruped: the actor outputs the mean μ
-  and a learnable log σ, actions are sampled with `torch.distributions.Normal`, and an entropy bonus
-  (coefficient in `config/train.yaml`) keeps σ from collapsing
+- It has been converted to a **tanh-squashed Gaussian policy** for the quadruped: the actor outputs
+  mean μ and learnable log σ, while actions and log-probabilities use the same bounded transform.
+  The entropy bonus estimates entropy after tanh instead of rewarding unbounded pre-tanh variance
 - The repository's `PPO_continuous.py` (continuous PPO for Pendulum-v1) was the reference for this conversion
 
 Core algorithm: PPO-Clip + GAE (Schulman et al. 2015/2017):
@@ -31,7 +31,7 @@ How the trained PPO policy drives the robot, end to end:
   ┌────────────────────────────────────────────────────────────────────────┐
   │  PPO policy (runs at 50 Hz in PPO.py)                                  │
   │                                                                        │
-  │  obs (45-d) ──► PolicyNet (Gaussian) ──► sample action a ∈ R¹²        │
+  │  obs (48-d) ──► PolicyNet (tanh Gaussian) ──► action a ∈ R¹²          │
   │                [base ang vel, projected  [clipped to [-1, 1]]          │
   │                 gravity, commands, joint                               │
   │                 pos/vel, previous action]                              │
@@ -52,7 +52,7 @@ How the trained PPO policy drives the robot, end to end:
   └───────────┬────────────────────────────────────────────────────────────┘
               │
               ├──► reward (velocity tracking + penalties) ──► GAE ──► PPO update
-              └──► next obs (45-d) ──► back to policy
+              └──► next obs (48-d，含机体线速度) ──► back to policy
 ```
 
 - **Policy outputs actions, not torques.** Each of the 12 actions is an offset added to the
@@ -94,6 +94,7 @@ python3 -m venv .venv
 
 # 4. Playback + video + curves
 .venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt --viewer   # live window
+.venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt --keyboard # keyboard control
 .venv/bin/python scripts/play_ppo.py --checkpoint runs/my_run/best.pt            # record mp4
 .venv/bin/python scripts/plot_results.py --logs logs/my_run logs/ref_baseline --labels mine baseline
 ```
@@ -117,3 +118,7 @@ is exposed via `info["reward_components"]` for debugging.
 Each entry in the YAML files is annotated with its meaning and unit.
 `scripts/train_ppo.py` reads `config/train.yaml` for defaults; command-line arguments
 override them for quick experiments (e.g. `--iterations 300`).
+
+训练默认启用课程学习：初期使用较小速度指令且关闭域随机化，随后在训练前 60% 的进度中
+逐步增加到完整难度。训练完成后使用 `--keyboard` 启动遥控：W/S 前后、A/D 横移、
+Q/E 转向、空格停止、R 重置。速度步长和上限均在 `config/play.yaml` 中配置。

@@ -16,6 +16,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -28,6 +30,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="回放你自己的 PPO 四足狗策略")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--viewer", action="store_true", help="打开实时可视化窗口（默认录视频）")
+    p.add_argument("--keyboard", action="store_true",
+                   help="viewer 中用键盘控制速度指令（自动启用 viewer）")
     p.add_argument("--output", type=str, default=None, help="视频输出路径（viewer 模式忽略）")
     p.add_argument("--duration", type=float, default=None, help="默认 config/play.yaml")
     p.add_argument("--fps", type=int, default=None, help="默认 config/play.yaml")
@@ -85,11 +89,22 @@ def run_viewer(args, env, agent):
     """实时可视化窗口：真实时间回放，R 键重置，鼠标旋转视角。"""
     import mujoco.viewer
 
+    keyboard_command = np.zeros(3)
+
+    def on_key(key):
+        if args.keyboard:
+            _update_keyboard_command(key, keyboard_command, env)
+        elif key in (ord("R"), ord("r")):
+            env.reset()
+
     viewer = mujoco.viewer.launch_passive(
         env.model, env.data,
-        key_callback=lambda key: _on_key(key, env),
+        key_callback=on_key,
     )
-    print("可视化窗口已打开：鼠标拖动=旋转视角，滚轮=缩放，R=重置，ESC 或关闭窗口退出")
+    if args.keyboard:
+        print("键盘控制：W/S 前后，A/D 左右，Q/E 转向，空格停止，R 重置")
+    else:
+        print("可视化窗口已打开：鼠标拖动=旋转视角，滚轮=缩放，R=重置")
 
     obs, _ = env.reset()
     step = 0
@@ -97,7 +112,7 @@ def run_viewer(args, env, agent):
         t = step * env.dt
         t0 = time.perf_counter()
 
-        env.set_commands(*command_at(t))
+        env.set_commands(*(keyboard_command if args.keyboard else command_at(t)))
         action = get_action(agent, obs)
         obs, _, terminated, truncated, info = env.step(action)
         viewer.sync()
@@ -121,9 +136,36 @@ def run_viewer(args, env, agent):
     time.sleep(PLAY_CFG["viewer_close_grace_seconds"])
 
 
-def _on_key(key, env):
-    if key in (82, 114):  # R / r
+def _update_keyboard_command(key, command, env):
+    """处理一次键盘事件；独立函数便于无 GUI 单元测试。"""
+    cfg = PLAY_CFG["keyboard"]
+    keys = cfg["keys"]
+
+    def code(name):
+        value = keys[name]
+        return 32 if value.lower() == "space" else ord(value.lower())
+
+    key = ord(chr(key).lower()) if 0 <= key < 128 and chr(key).isalpha() else key
+    if key == code("forward"):
+        command[0] += cfg["linear_step"]
+    elif key == code("backward"):
+        command[0] -= cfg["linear_step"]
+    elif key == code("left"):
+        command[1] += cfg["linear_step"]
+    elif key == code("right"):
+        command[1] -= cfg["linear_step"]
+    elif key == code("yaw_left"):
+        command[2] += cfg["yaw_step"]
+    elif key == code("yaw_right"):
+        command[2] -= cfg["yaw_step"]
+    elif key == code("stop"):
+        command[:] = 0.0
+    elif key == code("reset"):
         env.reset()
+    command[:] = np.clip(command,
+                         [-cfg["max_vx"], -cfg["max_vy"], -cfg["max_yaw_rate"]],
+                         [cfg["max_vx"], cfg["max_vy"], cfg["max_yaw_rate"]])
+    env.set_commands(*command)
 
 
 def record_video(args, env, agent):
@@ -174,6 +216,8 @@ def record_video(args, env, agent):
 
 def main():
     args = parse_args()
+    if args.keyboard:
+        args.viewer = True
     args.duration = PLAY_CFG["duration"] if args.duration is None else args.duration
     args.fps = PLAY_CFG["fps"] if args.fps is None else args.fps
 

@@ -21,12 +21,12 @@ def _require(config: dict, path: str):
 def _validate(name: str, config: dict) -> None:
     required = {
         "train": ["ppo.hidden_dims", "ppo.activation", "training.iterations",
-                  "evaluation.commands", "logging.print_every"],
+                  "evaluation.commands", "logging.print_every", "curriculum.enabled"],
         "env": ["simulation.decimation", "simulation.episode_length", "rewards.weights",
                 "domain_randomization.init"],
         "robot": ["xml_path", "default_dof_pos", "dof_lower", "dof_upper", "leg_names"],
         "pd": ["kp", "kd", "torque_limit", "action_scale"],
-        "play": ["duration", "fps", "video", "command_script"],
+        "play": ["duration", "fps", "video", "command_script", "keyboard.keys"],
         "plot": ["window", "figure_size", "dpi"],
     }
     for path in required.get(name, []):

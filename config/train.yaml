@@ -7,15 +7,15 @@ ppo:                        # 传给 PPO.py 的算法超参数
   hidden_init_gain: 1.41421356237
   actor_output_gain: 0.01
   critic_output_gain: 1.0
-  initial_log_std: -1.0
-  log_std_bounds: [-5.0, 2.0]
+  initial_log_std: -1.5
+  log_std_bounds: [-5.0, 0.0]
   numerical_epsilon: 1.0e-6 #   tanh log-prob 与归一化数值稳定项
   actor_lr: 3.0e-4          #   Actor（策略网络）学习率
   critic_lr: 1.0e-3         #   Critic（价值网络）学习率
   epochs: 5                 #   同一条 rollout 重复更新的轮数
   batch_size: 256           #   小批量大小：每个 epoch 先把 rollout 打乱再切成小批逐批更新
                             #   （rollout_len 2048 / batch 256 = 每个 epoch 8 次梯度更新）
-  entropy_coef: 0.01        #   熵正则系数：actor loss 减去 entropy_coef × 策略熵，
+  entropy_coef: 0.001       #   使用 tanh 后动作熵估计，避免方差持续膨胀
                             #   防止高斯 σ 塌缩到 0、保持探索（连续动作必需）
   eps: 0.2                  #   PPO 裁剪范围 ε（ratio 被裁剪到 [1−ε, 1+ε]）
   gamma: 0.99               #   折扣因子 γ（TD 目标与 GAE 共用）
@@ -31,7 +31,9 @@ training:                   # 训练循环配置
   seed: 1                   #   随机种子（复现实验用）
   save_every: 50            #   每多少迭代保存一次检查点
   device: auto              #   训练设备：auto / cuda / cpu
-  lr_anneal: true           #   训练过程中将学习率线性退火到 0
+  lr_anneal: true           #   训练过程中线性退火，但保留最小学习率
+  min_actor_lr: 3.0e-5
+  min_critic_lr: 1.0e-4
   checkpoint_every_iteration: true
   environment:
     add_noise: true
@@ -40,7 +42,7 @@ training:                   # 训练循环配置
 
 evaluation:
   every: 50
-  episodes: 3
+  episodes: 6               #   与下方六组固定指令一一对应
   episode_length: 500
   seed_offset: 10000
   deterministic: true
@@ -49,8 +51,24 @@ evaluation:
   command_override: true
   commands:
     - [0.0, 0.0, 0.0]
+    - [0.3, 0.0, 0.0]
     - [0.8, 0.0, 0.0]
+    - [-0.5, 0.0, 0.0]
+    - [0.0, 0.0, 0.6]
     - [0.4, 0.3, 0.5]
+  best_score:
+    tracking_error_weight: 100.0
+    fall_penalty: 200.0
+    minimum_survival_rate: 0.9
+    linear_error_success_threshold: 0.2
+    yaw_error_success_threshold: 0.2
 
 logging:
   print_every: 10
+
+curriculum:                  # 先学站稳和低速，再逐渐增加任务难度
+  enabled: true
+  start_fraction: 0.0        # 训练总进度达到此比例时开始增长
+  end_fraction: 0.6          # 达到此比例时使用完整指令和完整随机化
+  command_scale_start: 0.0   # 0=纯前进起始范围，1=完整范围
+  randomization_scale_start: 0.0

@@ -170,8 +170,13 @@ class PPO:
                 ratio = log_ratio.exp()
                 surr1 = ratio * advantages[idx]
                 surr2 = ratio.clamp(1.0 - self.eps, 1.0 + self.eps) * advantages[idx]
-                base_entropy = dist.entropy().sum(dim=-1).mean()
-                actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * base_entropy
+                entropy_raw_action = dist.rsample()
+                entropy_action = torch.tanh(entropy_raw_action)
+                squashed_entropy = -self._squashed_log_prob(
+                    dist, entropy_raw_action, entropy_action
+                ).mean()
+                actor_loss = (-torch.min(surr1, surr2).mean()
+                              - self.entropy_coef * squashed_entropy)
 
                 values = self.critic_net(states[idx]).squeeze(-1)
                 clipped_values = old_values[idx] + (values - old_values[idx]).clamp(
@@ -197,7 +202,7 @@ class PPO:
                     clip_fraction = ((ratio - 1.0).abs() > self.eps).float().mean()
                 for key, value in (
                     ("policy_loss", actor_loss), ("value_loss", value_loss),
-                    ("entropy", base_entropy), ("approx_kl", approx_kl),
+                    ("entropy", squashed_entropy), ("approx_kl", approx_kl),
                     ("clip_fraction", clip_fraction),
                 ):
                     metrics[key].append(float(value.detach().cpu()))

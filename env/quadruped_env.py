@@ -80,7 +80,7 @@ class QuadrupedEnv:
 
         self.num_joints = len(DEFAULT_DOF_POS)
         self.act_dim = self.num_joints
-        self.obs_dim = 3 + 3 + 3 + 3 * self.num_joints
+        self.obs_dim = 3 + 3 + 3 + 3 + 3 * self.num_joints
         self.step_count = 0
 
         # 运动学/动力学索引
@@ -113,6 +113,7 @@ class QuadrupedEnv:
         # 观测缩放（config/env.yaml → observation.scales）
         osc = self.cfg["observation"]["scales"]
         self.obs_scales = np.concatenate([
+            np.array([osc["base_lin_vel"]] * 3),        # base 线速度 (m/s)
             np.array([osc["base_ang_vel"]] * 3),        # base 角速度 (rad/s)
             np.array([osc["projected_gravity"]] * 3),   # 投影重力
             np.array(osc["commands"]),                  # 指令 vx, vy, yaw
@@ -127,6 +128,8 @@ class QuadrupedEnv:
         self.last_action = np.zeros(self.act_dim)
         self.last_dof_vel = np.zeros(self.num_joints)
         self.command_steps = 0
+        self.curriculum_command_scale = 1.0
+        self.curriculum_randomization_scale = 1.0
         self.action_delay = 0
         self.action_buffer = []
 
@@ -143,15 +146,19 @@ class QuadrupedEnv:
 
         # 初始位姿（训练时带小扰动，评估时从精确默认姿态开始）
         init_cfg = self.cfg["domain_randomization"]["init"]
+        randomization_scale = self.curriculum_randomization_scale if self.randomize else 0.0
         pos_range = init_cfg["pos_range"]
         self.data.qpos[0] = float(self.rng.uniform(*pos_range))
         self.data.qpos[1] = float(self.rng.uniform(*pos_range))
         self.data.qpos[2] = float(ROBOT_CFG["base_height_target"] + init_cfg["base_height_offset"]
-                                  + self.rng.uniform(-init_cfg["z_noise"], init_cfg["z_noise"]))
-        rpy = self.rng.uniform(-init_cfg["rpy_noise"], init_cfg["rpy_noise"], 3) \
+                                  + self.rng.uniform(-init_cfg["z_noise"], init_cfg["z_noise"])
+                                  * randomization_scale)
+        rpy_noise = init_cfg["rpy_noise"] * randomization_scale
+        rpy = self.rng.uniform(-rpy_noise, rpy_noise, 3) \
             if self.randomize else np.zeros(3)
         self.data.qpos[3:7] = self._rpy_to_quat(rpy)
-        dof_noise = self.rng.uniform(-init_cfg["dof_pos_noise"], init_cfg["dof_pos_noise"],
+        dof_pos_noise = init_cfg["dof_pos_noise"] * randomization_scale
+        dof_noise = self.rng.uniform(-dof_pos_noise, dof_pos_noise,
                                      self.num_joints) \
             if self.randomize else np.zeros(self.num_joints)
         self.data.qpos[self.joint_qpos_adr:] = DEFAULT_DOF_POS + dof_noise
@@ -188,7 +195,8 @@ class QuadrupedEnv:
 
         # 随机推一把（指令重采样时按概率触发，模拟外力干扰）
         push_cfg = self.cfg["domain_randomization"]["push"]
-        if self.randomize and self.command_steps == 0 and self.rng.random() < push_cfg["probability"]:
+        push_probability = push_cfg["probability"] * self.curriculum_randomization_scale
+        if self.randomize and self.command_steps == 0 and self.rng.random() < push_probability:
             self._apply_push()
 
         self.last_dof_vel = self.data.qvel[self.joint_qvel_adr:].copy()
@@ -211,12 +219,21 @@ class QuadrupedEnv:
             "commands": self.commands.copy(),
             "base_pos": self.data.qpos[0:3].copy(),
             "base_rpy": _quat_to_rpy(self.data.qpos[3:7]),
+            "base_lin_vel": _quat_rotate_inverse(
+                self.data.qpos[3:7], self.data.qvel[0:3]).copy(),
+            "base_ang_vel": _quat_rotate_inverse(
+                self.data.qpos[3:7], self.data.qvel[3:6]).copy(),
         }
         return obs, reward, terminated, truncated, info
 
     def set_commands(self, vx: float, vy: float, yaw_rate: float):
         """评估时由外部脚本设定指令（command_override=True 时生效）。"""
         self.commands[:] = [vx, vy, yaw_rate]
+
+    def set_curriculum(self, command_scale: float, randomization_scale: float):
+        """设置课程难度；范围均为 [0, 1]，通常由训练循环逐步提升。"""
+        self.curriculum_command_scale = float(np.clip(command_scale, 0.0, 1.0))
+        self.curriculum_randomization_scale = float(np.clip(randomization_scale, 0.0, 1.0))
 
     def get_default_dof_pos(self) -> np.ndarray:
         return DEFAULT_DOF_POS.copy()
@@ -227,6 +244,7 @@ class QuadrupedEnv:
     def _get_obs(self) -> np.ndarray:
         q = self.data.qpos[3:7]  # 基座四元数 [w,x,y,z]
 
+        base_lin_vel = _quat_rotate_inverse(q, self.data.qvel[0:3])
         base_ang_vel_world = self.data.qvel[3:6]
         base_ang_vel = _quat_rotate_inverse(q, base_ang_vel_world)      # 转到机体系
         projected_gravity = _quat_rotate_inverse(q, np.array([0, 0, -1]))
@@ -234,6 +252,7 @@ class QuadrupedEnv:
         dof_vel = self.data.qvel[self.joint_qvel_adr:]
 
         obs = np.concatenate([
+            base_lin_vel,
             base_ang_vel,
             projected_gravity,
             self.commands,
@@ -245,6 +264,7 @@ class QuadrupedEnv:
         if self.add_noise:
             n = self.obs_noise_std
             noise = np.concatenate([
+                self.rng.normal(0.0, n["base_lin_vel"], 3),
                 self.rng.normal(0.0, n["base_ang_vel"], 3),
                 self.rng.normal(0.0, n["projected_gravity"], 3),
                 np.zeros(3),                        # 指令不加噪
@@ -271,12 +291,13 @@ class QuadrupedEnv:
 
         cmd_vx, cmd_vy, cmd_yaw = self.commands
         r_cfg = self.cfg["rewards"]
-        sigma = r_cfg["tracking_sigma"]
         base_height_target = ROBOT_CFG["base_height_target"]
 
         r_lin_vel = float(np.exp(-((cmd_vx - base_lin_vel[0]) ** 2 +
-                                   (cmd_vy - base_lin_vel[1]) ** 2) / sigma))
-        r_ang_vel = float(np.exp(-(cmd_yaw - base_ang_vel[2]) ** 2 / sigma))
+                                   (cmd_vy - base_lin_vel[1]) ** 2) /
+                                 r_cfg["lin_tracking_sigma"]))
+        r_ang_vel = float(np.exp(-(cmd_yaw - base_ang_vel[2]) ** 2 /
+                                 r_cfg["ang_tracking_sigma"]))
         r_height = float(np.exp(-(base_height - base_height_target) ** 2
                                 * r_cfg["base_height_sigma"]))
 
@@ -304,6 +325,10 @@ class QuadrupedEnv:
             body_id = int(self.model.geom_bodyid[geom_id])
             feet_slip += float(np.sum(self.data.cvel[body_id, 3:5] ** 2))
         command_norm = float(np.linalg.norm(self.commands))
+        linear_command_norm = float(np.linalg.norm(self.commands[:2]))
+        horizontal_speed = float(np.linalg.norm(base_lin_vel[:2]))
+        no_motion = (linear_command_norm > r_cfg["moving_command_threshold"] and
+                     horizontal_speed < r_cfg["stationary_velocity_threshold"])
 
         w = r_cfg["weights"]
         components = {
@@ -322,6 +347,7 @@ class QuadrupedEnv:
             "undesired_contact": w["undesired_contact"] * undesired_contacts,
             "stand_pose": w["stand_pose"] * float(np.sum((q_joint - DEFAULT_DOF_POS) ** 2))
                           if command_norm < r_cfg["stand_command_threshold"] else 0.0,
+            "no_motion": w["no_motion"] if no_motion else 0.0,
             "termination": w["termination"] if terminated else 0.0,
         }
         return float(sum(components.values())), components
@@ -350,10 +376,20 @@ class QuadrupedEnv:
         self.command_steps = 0
         if self.command_override:
             return
-        if first and self.rng.random() < cmd_cfg["stand_still_prob"]:
+        progress = self.curriculum_command_scale
+        stand_prob = cmd_cfg["stand_still_prob"] + progress * (
+            cmd_cfg["stand_still_prob_final"] - cmd_cfg["stand_still_prob"]
+        )
+        if first and self.rng.random() < stand_prob:
             self.commands[:] = 0.0
         else:
-            r = cmd_cfg["ranges"]
+            start_ranges = cmd_cfg["curriculum_start_ranges"]
+            final_ranges = cmd_cfg["ranges"]
+            r = {}
+            for key in ("vx", "vy", "yaw_rate"):
+                start = np.asarray(start_ranges[key], dtype=float)
+                final = np.asarray(final_ranges[key], dtype=float)
+                r[key] = start + progress * (final - start)
             self.commands[:] = [
                 float(self.rng.uniform(*r["vx"])),
                 float(self.rng.uniform(*r["vy"])),
@@ -361,7 +397,9 @@ class QuadrupedEnv:
             ]
 
     def _randomize_friction(self):
+        scale = self.curriculum_randomization_scale
         lo, hi = self.cfg["domain_randomization"]["friction_range"]
+        lo, hi = 1.0 + (lo - 1.0) * scale, 1.0 + (hi - 1.0) * scale
         friction = float(self.rng.uniform(lo, hi))
         self.foot_friction[:] = friction
         for gid in self.foot_geom_ids:
@@ -376,20 +414,27 @@ class QuadrupedEnv:
 
     def _randomize_dynamics(self):
         cfg = self.cfg["domain_randomization"]
-        mass_scale = float(self.rng.uniform(*cfg["mass_scale_range"]))
+        scale = self.curriculum_randomization_scale
+        mass_lo, mass_hi = cfg["mass_scale_range"]
+        mass_range = (1.0 + (mass_lo - 1.0) * scale, 1.0 + (mass_hi - 1.0) * scale)
+        mass_scale = float(self.rng.uniform(*mass_range))
         self.model.body_mass[:] = self._base_body_mass * mass_scale
         self.model.body_inertia[:] = self._base_body_inertia * mass_scale
-        gain_scale = float(self.rng.uniform(*cfg["pd_gain_scale_range"]))
+        gain_lo, gain_hi = cfg["pd_gain_scale_range"]
+        gain_range = (1.0 + (gain_lo - 1.0) * scale, 1.0 + (gain_hi - 1.0) * scale)
+        gain_scale = float(self.rng.uniform(*gain_range))
         self.pd.kp = self._base_kp * gain_scale
         self.pd.kd = self._base_kd * gain_scale
-        lo, hi = cfg["action_delay_steps"]
+        lo, configured_hi = cfg["action_delay_steps"]
+        hi = lo + int(round((configured_hi - lo) * scale))
         self.action_delay = int(self.rng.integers(lo, hi + 1))
 
     def _apply_push(self):
         """对基座施加一次随机水平速度脉冲。"""
         lo, hi = self.cfg["domain_randomization"]["push"]["velocity_range"]
-        self.data.qvel[0] += float(self.rng.uniform(lo, hi))
-        self.data.qvel[1] += float(self.rng.uniform(lo, hi))
+        scale = self.curriculum_randomization_scale
+        self.data.qvel[0] += float(self.rng.uniform(lo, hi)) * scale
+        self.data.qvel[1] += float(self.rng.uniform(lo, hi)) * scale
 
     @staticmethod
     def _rpy_to_quat(rpy: np.ndarray) -> np.ndarray:
