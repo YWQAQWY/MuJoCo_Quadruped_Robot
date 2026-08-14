@@ -19,7 +19,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from config import PROJECT_DIR, load
+from config import PROJECT_DIR, deep_merge, load
 from control.pd_controller import PDController
 
 ROBOT_CFG = load("robot")   # config/robot.yaml
@@ -65,12 +65,13 @@ class QuadrupedEnv:
         randomize: bool = True,              # 域随机化（训练开、评估关）
         command_override: bool = False,      # 评估时由外部脚本设定指令
         include_base_lin_vel: bool = True,   # 新策略为 48 维；旧 checkpoint 可使用 45 维
+        config_override: dict | None = None, # 分阶段训练只覆盖需要改变的 env 字段
     ):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
         self.rng = np.random.default_rng(seed)
 
-        self.cfg = ENV_CFG
+        self.cfg = deep_merge(ENV_CFG, config_override)
         sim_cfg = self.cfg["simulation"]
         self.episode_length = int(sim_cfg["episode_length"] if episode_length is None else episode_length)
         self.decimation = int(sim_cfg["decimation"] if decimation is None else decimation)
@@ -391,7 +392,7 @@ class QuadrupedEnv:
         stand_prob = cmd_cfg["stand_still_prob"] + progress * (
             cmd_cfg["stand_still_prob_final"] - cmd_cfg["stand_still_prob"]
         )
-        if first and self.rng.random() < stand_prob:
+        if self.rng.random() < stand_prob:
             self.commands[:] = 0.0
         else:
             start_ranges = cmd_cfg["curriculum_start_ranges"]

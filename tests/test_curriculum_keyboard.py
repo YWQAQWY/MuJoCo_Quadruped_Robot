@@ -7,7 +7,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import load  # noqa: E402
+from config import deep_merge, load  # noqa: E402
 from env.quadruped_env import QuadrupedEnv  # noqa: E402
 from scripts.play_ppo import _update_keyboard_command  # noqa: E402
 from scripts.train_ppo import curriculum_scales  # noqa: E402
@@ -19,6 +19,11 @@ def test_curriculum_schedule():
     end = curriculum_scales(99, 100, cfg)
     assert np.allclose(start, [cfg["command_scale_start"], cfg["randomization_scale_start"]])
     assert np.allclose(end, [1.0, 1.0])
+
+    stage = load("stages")["stage2_forward"]
+    stage_cfg = deep_merge(load("train"), stage["train"])["curriculum"]
+    stage_end = curriculum_scales(499, 500, stage_cfg)
+    assert np.allclose(stage_end, [1.0, 0.25])
 
     env = QuadrupedEnv(seed=0, add_noise=False, randomize=False)
     env.set_curriculum(*start)

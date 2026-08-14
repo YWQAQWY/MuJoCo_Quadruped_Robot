@@ -122,3 +122,25 @@ override them for quick experiments (e.g. `--iterations 300`).
 训练默认启用课程学习：初期使用较小速度指令且关闭域随机化，随后在训练前 60% 的进度中
 逐步增加到完整难度。训练完成后使用 `--keyboard` 启动遥控：W/S 前后、A/D 横移、
 Q/E 转向、空格停止、R 重置。速度步长和上限均在 `config/play.yaml` 中配置。
+
+## Staged training
+
+阶段参数集中在 `config/stages.yaml`。开始新阶段使用 `--init-checkpoint`，它继承上一阶段
+Actor、Critic 和优化器动量，但将新阶段 iteration、课程进度和 best score 重新计数；同一阶段
+意外中断才使用 `--resume`。
+
+```bash
+# 第二阶段：从第一阶段站立模型学习基础前进
+.venv/bin/python scripts/train_ppo.py --stage stage2_forward \
+  --init-checkpoint runs/locomotion_v2/best.pt --run-name stage2_forward
+
+# 第二阶段中断续训（会从 checkpoint 自动恢复 stage2 配置）
+.venv/bin/python scripts/train_ppo.py --resume runs/stage2_forward/last.pt
+
+# 第二阶段达标后进入第三阶段
+.venv/bin/python scripts/train_ppo.py --stage stage3_backward_yaw \
+  --init-checkpoint runs/stage2_forward/best.pt --run-name stage3_backward_yaw
+```
+
+每一阶段持续混入旧任务，并同时设置存活率与成功率门槛。未达到门槛时只保存 `last.pt`，
+不会生成误导性的 `best.pt`，此时不应进入下一阶段。

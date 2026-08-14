@@ -27,11 +27,12 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import load, load_all  # noqa: E402
+from config import deep_merge, load, load_all  # noqa: E402
 from env.quadruped_env import QuadrupedEnv  # noqa: E402
 from PPO import PPO  # noqa: E402
 
 TRAIN_CFG = load("train")  # config/train.yaml
+STAGES_CFG = load("stages")
 
 
 def parse_args():
@@ -51,6 +52,10 @@ def parse_args():
     p.add_argument("--device", type=str, default=None,
                    choices=["auto", "cuda", "cpu"], help="默认 config/train.yaml")
     p.add_argument("--resume", type=str, default=None, help="从完整 checkpoint 恢复训练")
+    p.add_argument("--init-checkpoint", type=str, default=None,
+                   help="用上一阶段 checkpoint 初始化新阶段（iteration 从 0 开始）")
+    p.add_argument("--stage", choices=sorted(STAGES_CFG), default=None,
+                   help="使用 config/stages.yaml 中的阶段覆盖配置")
     return p.parse_args()
 
 
@@ -72,13 +77,14 @@ def make_checkpoint(agent, iteration, total_steps, best_eval_score, config):
     }
 
 
-def evaluate(agent, seed, eval_cfg):
+def evaluate(agent, seed, eval_cfg, env_override=None):
     """固定指令评估；显式衡量跟踪误差，避免把稳定站立选为 best。"""
     commands = eval_cfg["commands"]
     episode_length = eval_cfg["episode_length"]
     env = QuadrupedEnv(seed=seed, episode_length=episode_length,
                        add_noise=eval_cfg["add_noise"], randomize=eval_cfg["randomize"],
-                       command_override=eval_cfg["command_override"])
+                       command_override=eval_cfg["command_override"],
+                       config_override=env_override)
     rewards, lengths, lin_errors, yaw_errors, successes = [], [], [], [], []
     falls = 0
     for ep in range(eval_cfg["episodes"]):
@@ -132,18 +138,29 @@ def curriculum_scales(iteration, iterations, cfg):
     alpha = float(np.clip((progress - cfg["start_fraction"]) / span, 0.0, 1.0))
     command_scale = cfg["command_scale_start"] + alpha * (1.0 - cfg["command_scale_start"])
     randomization_scale = cfg["randomization_scale_start"] + alpha * (
-        1.0 - cfg["randomization_scale_start"]
+        cfg.get("randomization_scale_end", 1.0) - cfg["randomization_scale_start"]
     )
     return command_scale, randomization_scale
 
 
 def main():
     args = parse_args()
-    ppo_cfg = TRAIN_CFG["ppo"]
-    tr_cfg = TRAIN_CFG["training"]
-    eval_cfg = TRAIN_CFG["evaluation"]
-    log_cfg = TRAIN_CFG["logging"]
-    curriculum_cfg = TRAIN_CFG["curriculum"]
+    if args.resume and args.init_checkpoint:
+        raise ValueError("--resume 与 --init-checkpoint 不能同时使用")
+    if args.resume and args.stage is None:
+        resume_meta = torch.load(args.resume, map_location="cpu", weights_only=False)
+        saved_stage = resume_meta.get("config", {}).get("active_stage", {}).get("name")
+        if saved_stage in STAGES_CFG:
+            args.stage = saved_stage
+            print(f"从 checkpoint 自动恢复阶段配置: {saved_stage}")
+    stage_cfg = STAGES_CFG.get(args.stage, {})
+    active_train_cfg = deep_merge(TRAIN_CFG, stage_cfg.get("train"))
+    env_override = stage_cfg.get("env")
+    ppo_cfg = active_train_cfg["ppo"]
+    tr_cfg = active_train_cfg["training"]
+    eval_cfg = active_train_cfg["evaluation"]
+    log_cfg = active_train_cfg["logging"]
+    curriculum_cfg = active_train_cfg["curriculum"]
 
     def cfg(cli_val, key):
         """命令行参数优先，缺省用 config/train.yaml 的 training 段。"""
@@ -166,7 +183,8 @@ def main():
     env_options = tr_cfg["environment"]
     env = QuadrupedEnv(seed=seed, add_noise=env_options["add_noise"],
                        randomize=env_options["randomize"],
-                       command_override=env_options["command_override"])
+                       command_override=env_options["command_override"],
+                       config_override=env_override)
     hidden_dims = ([args.hidden_dim, args.hidden_dim] if args.hidden_dim is not None
                    else ppo_cfg["hidden_dims"])
     actor_lr = args.actor_lr if args.actor_lr is not None else ppo_cfg["actor_lr"]
@@ -197,7 +215,7 @@ def main():
     )
 
     effective_config = load_all()
-    effective_train = copy.deepcopy(TRAIN_CFG)
+    effective_train = copy.deepcopy(active_train_cfg)
     effective_train["ppo"].update({
         "hidden_dims": hidden_dims, "actor_lr": actor_lr, "critic_lr": critic_lr,
         "gamma": gamma, "lmbda": agent.lmbda, "epochs": agent.epoch, "eps": agent.eps,
@@ -207,9 +225,15 @@ def main():
         "save_every": save_every, "device": device,
     })
     effective_config["train"] = effective_train
+    effective_config["env"] = deep_merge(load("env"), env_override)
+    effective_config["active_stage"] = {
+        "name": args.stage, "description": stage_cfg.get("description"),
+        "parent_checkpoint": args.init_checkpoint,
+    }
 
-    run_name = args.run_name or (Path(args.resume).parent.name if args.resume
-                                 else time.strftime("run_%Y%m%d_%H%M%S"))
+    default_name = f"{args.stage}_{time.strftime('%Y%m%d_%H%M%S')}" if args.stage else \
+        time.strftime("run_%Y%m%d_%H%M%S")
+    run_name = args.run_name or (Path(args.resume).parent.name if args.resume else default_name)
     run_dir = ROOT / "runs" / run_name
     log_dir = ROOT / "logs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -218,6 +242,17 @@ def main():
     start_iteration = 0
     total_steps = 0
     best_eval_score = -float("inf")
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
+        agent.actor_net.load_state_dict(checkpoint["actor"])
+        agent.critic_net.load_state_dict(checkpoint["critic"])
+        if stage_cfg.get("inherit_optimizer", True):
+            agent.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
+            agent.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+        # 新阶段重新使用本阶段初始学习率，不继承上一阶段末尾的退火值。
+        agent.actor_optimizer.param_groups[0]["lr"] = actor_lr
+        agent.critic_optimizer.param_groups[0]["lr"] = critic_lr
+        print(f"阶段初始化: {args.init_checkpoint} → {args.stage or 'custom'}（从 iteration 0 开始）")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         agent.actor_net.load_state_dict(checkpoint["actor"])
@@ -309,7 +344,9 @@ def main():
             "linear_error", "yaw_error", "survival_rate", "success_rate", "score")}
         should_eval = (it + 1) % eval_cfg["every"] == 0 or it == iterations - 1
         if should_eval:
-            eval_metrics = evaluate(agent, seed + eval_cfg["seed_offset"], eval_cfg)
+            eval_metrics = evaluate(
+                agent, seed + eval_cfg["seed_offset"], eval_cfg, env_override
+            )
             eval_reward = eval_metrics["reward"]
             eval_ep_len = eval_metrics["episode_length"]
         writer.writerow([
@@ -331,7 +368,9 @@ def main():
                   f"回合长度 {mean_ep_len:6.1f} | {fps:6.0f} fps")
 
         eligible = (should_eval and eval_metrics["survival_rate"] >=
-                    eval_cfg["best_score"]["minimum_survival_rate"])
+                    eval_cfg["best_score"]["minimum_survival_rate"] and
+                    eval_metrics["success_rate"] >=
+                    eval_cfg["best_score"].get("minimum_success_rate", 0.0))
         is_new_best = eligible and eval_metrics["score"] > best_eval_score
         if is_new_best:
             best_eval_score = eval_metrics["score"]
@@ -344,7 +383,10 @@ def main():
             torch.save(checkpoint, run_dir / "best.pt")
 
     csv_file.close()
-    print(f"训练完成。最终模型在 runs/{run_name}/last.pt，最佳评估模型在 best.pt")
+    if (run_dir / "best.pt").exists():
+        print(f"训练完成。最终模型在 runs/{run_name}/last.pt，合格最佳模型在 best.pt")
+    else:
+        print(f"训练完成。最终模型在 runs/{run_name}/last.pt；尚未达到本阶段门槛，未生成 best.pt")
 
 
 if __name__ == "__main__":

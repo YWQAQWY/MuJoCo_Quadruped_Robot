@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import copy
 
 import yaml
 
@@ -52,3 +53,14 @@ def load(name: str) -> dict:
 def load_all() -> dict[str, dict]:
     """加载并校验 config/ 下全部 YAML，便于保存完整实验配置。"""
     return {path.stem: load(path.stem) for path in sorted(CONFIG_DIR.glob("*.yaml"))}
+
+
+def deep_merge(base: dict, override: dict | None) -> dict:
+    """递归合并配置并返回副本；阶段配置可只写需要改变的字段。"""
+    result = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result

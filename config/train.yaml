@@ -72,3 +72,4 @@ curriculum:                  # 先学站稳和低速，再逐渐增加任务难�
   end_fraction: 0.6          # 达到此比例时使用完整指令和完整随机化
   command_scale_start: 0.0   # 0=纯前进起始范围，1=完整范围
   randomization_scale_start: 0.0
+  randomization_scale_end: 1.0

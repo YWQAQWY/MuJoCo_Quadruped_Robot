@@ -1,0 +1,135 @@
+# ================= 分阶段训练配置 =================
+# stage1 已由 locomotion_v2/best.pt 提供稳定站立能力；后续阶段使用 --init-checkpoint 串联。
+
+stage1_stand:
+  description: 稳定站立和扰动恢复
+  inherit_optimizer: true
+  train:
+    training:
+      iterations: 300
+    curriculum:
+      command_scale_start: 0.0
+      randomization_scale_start: 0.0
+      randomization_scale_end: 0.15
+      end_fraction: 0.8
+    evaluation:
+      commands:
+        - [0.0, 0.0, 0.0]
+      episodes: 1
+      best_score:
+        minimum_survival_rate: 0.95
+        minimum_success_rate: 1.0
+  env:
+    commands:
+      stand_still_prob: 1.0
+      stand_still_prob_final: 1.0
+      curriculum_start_ranges: {vx: [0.0, 0.0], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+      ranges: {vx: [0.0, 0.0], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+
+stage2_forward:
+  description: 保留站立能力，学习起步、前进、变速和停止
+  inherit_optimizer: true
+  train:
+    training:
+      iterations: 500
+    curriculum:
+      command_scale_start: 0.0
+      randomization_scale_start: 0.05
+      randomization_scale_end: 0.25
+      end_fraction: 0.8
+    evaluation:
+      commands:
+        - [0.0, 0.0, 0.0]
+        - [0.2, 0.0, 0.0]
+        - [0.3, 0.0, 0.0]
+        - [0.5, 0.0, 0.0]
+      episodes: 4
+      best_score:
+        minimum_survival_rate: 0.95
+        minimum_success_rate: 0.75
+  env:
+    commands:
+      stand_still_prob: 0.2
+      stand_still_prob_final: 0.15
+      curriculum_start_ranges: {vx: [0.1, 0.3], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+      ranges: {vx: [0.1, 0.6], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+
+stage3_backward_yaw:
+  description: 保留站立和前进，加入后退与原地转向
+  inherit_optimizer: true
+  train:
+    training: {iterations: 500}
+    curriculum:
+      command_scale_start: 0.0
+      randomization_scale_start: 0.25
+      randomization_scale_end: 0.5
+      end_fraction: 0.8
+    evaluation:
+      commands:
+        - [0.0, 0.0, 0.0]
+        - [0.3, 0.0, 0.0]
+        - [-0.3, 0.0, 0.0]
+        - [0.0, 0.0, 0.5]
+        - [0.0, 0.0, -0.5]
+      episodes: 5
+      best_score: {minimum_survival_rate: 0.95, minimum_success_rate: 0.8}
+  env:
+    commands:
+      stand_still_prob: 0.15
+      stand_still_prob_final: 0.1
+      curriculum_start_ranges: {vx: [-0.2, 0.5], vy: [0.0, 0.0], yaw_rate: [-0.2, 0.2]}
+      ranges: {vx: [-0.6, 0.8], vy: [0.0, 0.0], yaw_rate: [-0.8, 0.8]}
+
+stage4_lateral_combined:
+  description: 加入横移以及平移和转向组合
+  inherit_optimizer: true
+  train:
+    training: {iterations: 500}
+    curriculum:
+      command_scale_start: 0.0
+      randomization_scale_start: 0.5
+      randomization_scale_end: 0.75
+      end_fraction: 0.8
+    evaluation:
+      commands:
+        - [0.0, 0.0, 0.0]
+        - [0.4, 0.0, 0.0]
+        - [-0.3, 0.0, 0.0]
+        - [0.0, 0.3, 0.0]
+        - [0.0, -0.3, 0.0]
+        - [0.4, 0.2, 0.4]
+      episodes: 6
+      best_score: {minimum_survival_rate: 0.95, minimum_success_rate: 0.66}
+  env:
+    commands:
+      stand_still_prob: 0.1
+      stand_still_prob_final: 0.1
+      curriculum_start_ranges: {vx: [-0.4, 0.7], vy: [-0.2, 0.2], yaw_rate: [-0.4, 0.4]}
+      ranges: {vx: [-0.8, 1.0], vy: [-0.5, 0.5], yaw_rate: [-1.0, 1.0]}
+
+stage5_robust:
+  description: 完整指令、完整域随机化和抗推搡
+  inherit_optimizer: true
+  train:
+    training: {iterations: 700}
+    curriculum:
+      command_scale_start: 0.0
+      randomization_scale_start: 0.75
+      randomization_scale_end: 1.0
+      end_fraction: 0.5
+    evaluation:
+      commands:
+        - [0.0, 0.0, 0.0]
+        - [0.5, 0.0, 0.0]
+        - [-0.5, 0.0, 0.0]
+        - [0.0, 0.4, 0.0]
+        - [0.0, 0.0, 0.7]
+        - [0.5, 0.3, 0.5]
+      episodes: 6
+      best_score: {minimum_survival_rate: 0.95, minimum_success_rate: 0.8}
+  env:
+    commands:
+      stand_still_prob: 0.1
+      stand_still_prob_final: 0.1
+      curriculum_start_ranges: {vx: [-0.8, 0.8], vy: [-0.4, 0.4], yaw_rate: [-0.8, 0.8]}
+      ranges: {vx: [-1.0, 1.0], vy: [-0.6, 0.6], yaw_rate: [-1.0, 1.0]}
