@@ -100,4 +100,10 @@
 - entropy 改为 tanh 后有界动作分布的采样估计；entropy coefficient 降至 0.001，初始 log std 为 -1.5，上限为 0。
 - Actor/Critic 学习率退火保留 `3e-5/1e-4` 下限，不再在训练末期降为零。
 - 评估增加线速度误差、转向误差、存活率、成功率与 tracking score；`best.pt` 需满足 90% 存活率并按 tracking score 选取。
-- 新网络输入维度为 48，旧的 45 维 checkpoint 不再兼容，需要重新训练。
+- 新训练网络输入维度为 48，旧的 45 维 checkpoint 不能用于续训，但可通过回放兼容层继续播放。
+
+### 旧 checkpoint 回放兼容
+
+- `play_ppo.py` 会从 Actor 第一层权重自动识别 checkpoint 使用 45 维还是 48 维观测。
+- `my_run` 等旧模型自动关闭基座线速度观测，可继续用于回放和键盘控制。
+- 新训练模型继续使用包含基座线速度的 48 维观测；该兼容层不改变新训练流程。

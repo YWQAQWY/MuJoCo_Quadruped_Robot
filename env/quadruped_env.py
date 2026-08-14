@@ -64,6 +64,7 @@ class QuadrupedEnv:
         add_noise: bool = True,              # 观测噪声（训练开、评估关）
         randomize: bool = True,              # 域随机化（训练开、评估关）
         command_override: bool = False,      # 评估时由外部脚本设定指令
+        include_base_lin_vel: bool = True,   # 新策略为 48 维；旧 checkpoint 可使用 45 维
     ):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
@@ -76,11 +77,12 @@ class QuadrupedEnv:
         self.add_noise = add_noise
         self.randomize = randomize
         self.command_override = command_override
+        self.include_base_lin_vel = include_base_lin_vel
         self.dt = self.model.opt.timestep * self.decimation  # 控制周期 0.02 s
 
         self.num_joints = len(DEFAULT_DOF_POS)
         self.act_dim = self.num_joints
-        self.obs_dim = 3 + 3 + 3 + 3 + 3 * self.num_joints
+        self.obs_dim = (3 if include_base_lin_vel else 0) + 3 + 3 + 3 + 3 * self.num_joints
         self.step_count = 0
 
         # 运动学/动力学索引
@@ -112,8 +114,10 @@ class QuadrupedEnv:
 
         # 观测缩放（config/env.yaml → observation.scales）
         osc = self.cfg["observation"]["scales"]
-        self.obs_scales = np.concatenate([
-            np.array([osc["base_lin_vel"]] * 3),        # base 线速度 (m/s)
+        scale_parts = []
+        if self.include_base_lin_vel:
+            scale_parts.append(np.array([osc["base_lin_vel"]] * 3))
+        scale_parts.extend([
             np.array([osc["base_ang_vel"]] * 3),        # base 角速度 (rad/s)
             np.array([osc["projected_gravity"]] * 3),   # 投影重力
             np.array(osc["commands"]),                  # 指令 vx, vy, yaw
@@ -121,6 +125,7 @@ class QuadrupedEnv:
             np.full(self.num_joints, osc["dof_vel"]),   # 关节角速度
             np.full(self.num_joints, osc["actions"]),   # 上一步动作
         ])
+        self.obs_scales = np.concatenate(scale_parts)
         self.obs_noise_std = self.cfg["observation"]["noise"]
 
         self.commands = np.zeros(3)         # [vx, vy, yaw_rate]，机体坐标系
@@ -251,20 +256,25 @@ class QuadrupedEnv:
         dof_pos = self.data.qpos[self.joint_qpos_adr:] - DEFAULT_DOF_POS
         dof_vel = self.data.qvel[self.joint_qvel_adr:]
 
-        obs = np.concatenate([
-            base_lin_vel,
+        obs_parts = []
+        if self.include_base_lin_vel:
+            obs_parts.append(base_lin_vel)
+        obs_parts.extend([
             base_ang_vel,
             projected_gravity,
             self.commands,
             dof_pos,
             dof_vel,
             self.actions,
-        ]) * self.obs_scales
+        ])
+        obs = np.concatenate(obs_parts) * self.obs_scales
 
         if self.add_noise:
             n = self.obs_noise_std
-            noise = np.concatenate([
-                self.rng.normal(0.0, n["base_lin_vel"], 3),
+            noise_parts = []
+            if self.include_base_lin_vel:
+                noise_parts.append(self.rng.normal(0.0, n["base_lin_vel"], 3))
+            noise_parts.extend([
                 self.rng.normal(0.0, n["base_ang_vel"], 3),
                 self.rng.normal(0.0, n["projected_gravity"], 3),
                 np.zeros(3),                        # 指令不加噪
@@ -272,6 +282,7 @@ class QuadrupedEnv:
                 self.rng.normal(0.0, n["dof_vel"], self.num_joints),
                 np.zeros(self.num_joints),          # 动作不加噪
             ])
+            noise = np.concatenate(noise_parts)
             obs += noise
         return obs.astype(np.float32)
 

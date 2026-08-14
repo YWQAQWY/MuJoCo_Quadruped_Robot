@@ -26,6 +26,19 @@ from config import load  # noqa: E402
 PLAY_CFG = load("play")
 
 
+def checkpoint_observation_dim(checkpoint_path):
+    """从 Actor 第一层权重推断观测维度，兼容 45/48 维 checkpoint。"""
+    import torch
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    actor_state = checkpoint["actor"]
+    first_weight = next(
+        value for key, value in actor_state.items()
+        if key.endswith("network.0.weight") or key.endswith("fc1.weight")
+    )
+    return int(first_weight.shape[1])
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="回放你自己的 PPO 四足狗策略")
     p.add_argument("--checkpoint", type=str, required=True)
@@ -223,11 +236,15 @@ def main():
 
     from env.quadruped_env import QuadrupedEnv
 
+    checkpoint_obs_dim = checkpoint_observation_dim(args.checkpoint)
+    if checkpoint_obs_dim not in (45, 48):
+        raise ValueError(f"不支持的 checkpoint 观测维度: {checkpoint_obs_dim}")
     env = QuadrupedEnv(seed=PLAY_CFG["seed"], add_noise=PLAY_CFG["add_noise"],
                        randomize=PLAY_CFG["randomize"],
-                       command_override=PLAY_CFG["command_override"])
+                       command_override=PLAY_CFG["command_override"],
+                       include_base_lin_vel=checkpoint_obs_dim == 48)
     agent = load_agent(env, args)
-    print(f"已加载 {args.checkpoint}")
+    print(f"已加载 {args.checkpoint}（{checkpoint_obs_dim} 维观测）")
 
     if args.viewer:
         run_viewer(args, env, agent)
