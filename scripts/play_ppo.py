@@ -237,12 +237,19 @@ def main():
     from env.quadruped_env import QuadrupedEnv
 
     checkpoint_obs_dim = checkpoint_observation_dim(args.checkpoint)
-    if checkpoint_obs_dim not in (45, 48):
+    if checkpoint_obs_dim not in (45, 48, 54):
         raise ValueError(f"不支持的 checkpoint 观测维度: {checkpoint_obs_dim}")
+    import torch
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    saved_pd = checkpoint.get("config", {}).get("pd")
+    saved_env = checkpoint.get("config", {}).get("env")
     env = QuadrupedEnv(seed=PLAY_CFG["seed"], add_noise=PLAY_CFG["add_noise"],
                        randomize=PLAY_CFG["randomize"],
                        command_override=PLAY_CFG["command_override"],
-                       include_base_lin_vel=checkpoint_obs_dim == 48)
+                       include_base_lin_vel=checkpoint_obs_dim in (48, 54),
+                       include_gait_obs=checkpoint_obs_dim == 54,
+                       config_override=saved_env,
+                       pd_config_override=saved_pd)
     agent = load_agent(env, args)
     print(f"已加载 {args.checkpoint}（{checkpoint_obs_dim} 维观测）")
 

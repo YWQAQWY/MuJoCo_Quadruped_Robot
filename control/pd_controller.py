@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import load
+from config import deep_merge, load
 
 PD_CFG = load("pd")  # config/pd.yaml
 
@@ -30,23 +30,33 @@ class PDController:
         kd: float | None = None,
         torque_limit: float | None = None,
         action_scale: float | None = None,
+        config_override: dict | None = None,
     ):
         self.data = data
         self.default_dof_pos = np.asarray(default_dof_pos, dtype=float)
         self.num_joints = len(self.default_dof_pos)
         self.joint_qpos_adr = joint_qpos_adr
         self.joint_qvel_adr = joint_qvel_adr
-        # 显式传参优先，否则用 config/pd.yaml 的默认值
-        self.kp = float(PD_CFG["kp"] if kp is None else kp)
-        self.kd = float(PD_CFG["kd"] if kd is None else kd)
-        self.torque_limit = float(PD_CFG["torque_limit"] if torque_limit is None else torque_limit)
-        self.action_scale = float(PD_CFG["action_scale"] if action_scale is None else action_scale)
+        cfg = deep_merge(PD_CFG, config_override)
+        # 显式传参优先，否则用合并后的 PD 配置
+        self.kp = float(cfg["kp"] if kp is None else kp)
+        self.kd = float(cfg["kd"] if kd is None else kd)
+        self.torque_limit = float(cfg["torque_limit"] if torque_limit is None else torque_limit)
+        self.action_scale = float(cfg["action_scale"] if action_scale is None else action_scale)
         self.target = self.default_dof_pos.copy()
 
     def set_action(self, action: np.ndarray) -> np.ndarray:
         """策略动作 → 目标关节角。action: [num_joints]，会被裁剪到 [-1, 1]。"""
         action = np.clip(action, -1.0, 1.0)
         self.target = self.default_dof_pos + self.action_scale * action
+        return self.target
+
+    def set_target_offsets(self, offsets: np.ndarray) -> np.ndarray:
+        """Set joint targets from radian offsets relative to the default pose."""
+        offsets = np.asarray(offsets, dtype=float)
+        if offsets.shape != (self.num_joints,):
+            raise ValueError(f"offsets shape must be {(self.num_joints,)}, got {offsets.shape}")
+        self.target = self.default_dof_pos + offsets
         return self.target
 
     def compute_torques(self) -> np.ndarray:

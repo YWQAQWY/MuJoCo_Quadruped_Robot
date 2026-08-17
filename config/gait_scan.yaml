@@ -1,0 +1,19 @@
+# 参考步态物理可行性扫描；scripts/validate_reference_gait.py 读取。
+seed: 7
+command: [0.3, 0.0, 0.0]
+duration_seconds: 10.0
+minimum_forward_velocity: 0.1
+minimum_survival_fraction: 1.0
+maximum_torso_contacts: 0
+maximum_all_feet_contact_rate: 0.8
+minimum_air_rate_per_foot: 0.05
+report_path: logs/reference_gait_scan.json
+
+# 笛卡尔积扫描。首次运行应先用较小集合确认关节方向，再扩展范围。
+grid:
+  phase_frequency: [1.2, 1.5, 1.8]
+  duty_factor: [0.52, 0.58]
+  hip_pitch_amplitude: [-0.3, -0.15, 0.15, 0.3]
+  knee_amplitude: [-0.1, 0.1]
+  swing_knee_lift: [-0.45, -0.3, 0.3, 0.45]
+  phase_bias: [-0.8, 0.5]

@@ -65,7 +65,9 @@ class QuadrupedEnv:
         randomize: bool = True,              # 域随机化（训练开、评估关）
         command_override: bool = False,      # 评估时由外部脚本设定指令
         include_base_lin_vel: bool = True,   # 新策略为 48 维；旧 checkpoint 可使用 45 维
+        include_gait_obs: bool = True,       # phase(2)+足端接触(4)，新版共 54 维
         config_override: dict | None = None, # 分阶段训练只覆盖需要改变的 env 字段
+        pd_config_override: dict | None = None,
     ):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
@@ -79,11 +81,13 @@ class QuadrupedEnv:
         self.randomize = randomize
         self.command_override = command_override
         self.include_base_lin_vel = include_base_lin_vel
+        self.include_gait_obs = include_gait_obs
         self.dt = self.model.opt.timestep * self.decimation  # 控制周期 0.02 s
 
         self.num_joints = len(DEFAULT_DOF_POS)
         self.act_dim = self.num_joints
-        self.obs_dim = (3 if include_base_lin_vel else 0) + 3 + 3 + 3 + 3 * self.num_joints
+        self.obs_dim = ((3 if include_base_lin_vel else 0) + 3 + 3 + 3 +
+                        3 * self.num_joints + (6 if include_gait_obs else 0))
         self.step_count = 0
 
         # 运动学/动力学索引
@@ -99,6 +103,8 @@ class QuadrupedEnv:
             for leg in ROBOT_CFG["leg_names"]
         ]
         self.foot_body_ids = [int(self.model.geom_bodyid[gid]) for gid in self.foot_geom_ids]
+        self.foot_geom_id_to_index = {gid: i for i, gid in enumerate(self.foot_geom_ids)}
+        self.foot_body_id_to_index = {bid: i for i, bid in enumerate(self.foot_body_ids)}
         self._base_body_mass = self.model.body_mass.copy()
         self._base_body_inertia = self.model.body_inertia.copy()
         self._base_kp = self.pd.kp if hasattr(self, "pd") else None
@@ -108,7 +114,8 @@ class QuadrupedEnv:
 
         # PD 控制器（control/pd_controller.py）：动作 → 目标关节角 → 力矩
         self.pd = PDController(
-            self.data, DEFAULT_DOF_POS, self.joint_qpos_adr, self.joint_qvel_adr
+            self.data, DEFAULT_DOF_POS, self.joint_qpos_adr, self.joint_qvel_adr,
+            config_override=pd_config_override,
         )
         self._base_kp = self.pd.kp
         self._base_kd = self.pd.kd
@@ -126,6 +133,11 @@ class QuadrupedEnv:
             np.full(self.num_joints, osc["dof_vel"]),   # 关节角速度
             np.full(self.num_joints, osc["actions"]),   # 上一步动作
         ])
+        if self.include_gait_obs:
+            scale_parts.extend([
+                np.full(2, osc["phase"]),
+                np.full(len(self.foot_geom_ids), osc["foot_contacts"]),
+            ])
         self.obs_scales = np.concatenate(scale_parts)
         self.obs_noise_std = self.cfg["observation"]["noise"]
 
@@ -134,13 +146,29 @@ class QuadrupedEnv:
         self.last_action = np.zeros(self.act_dim)
         self.last_dof_vel = np.zeros(self.num_joints)
         self.command_steps = 0
+        self.gait_phase = 0.0
+        self.foot_air_time = np.zeros(len(self.foot_geom_ids))
+        self.last_foot_contacts = np.zeros(len(self.foot_geom_ids), dtype=bool)
+        self.feet_air_time_reward = 0.0
         self.curriculum_command_scale = 1.0
         self.curriculum_randomization_scale = 1.0
+        self.curriculum_residual_scale = float(self.cfg["gait"]["residual_control"]["scale"])
+        self.curriculum_frequency_scale = 1.0
         self.action_delay = 0
         self.action_buffer = []
+        gait_cfg = self.cfg["gait"]
+        self.gait_phase = (float(self.rng.random())
+                           if self.randomize and gait_cfg["randomize_initial_phase"] else 0.0)
+        self.foot_air_time[:] = 0.0
+        self.last_foot_contacts[:] = False
+        self.feet_air_time_reward = 0.0
 
         # 每回合随机化的摩擦系数（评估时不随机化）
         self.foot_friction = np.full(len(self.foot_geom_ids), 1.0)
+        self.foot_contact_forces = np.zeros(len(self.foot_geom_ids))
+        self.body_contact_count = 0
+        self.torso_contact_count = 0
+        self.reference_action = np.zeros(self.act_dim)
 
     # ------------------------------------------------------------------ #
     # 对外接口
@@ -175,6 +203,12 @@ class QuadrupedEnv:
         self.last_dof_vel[:] = 0.0
         self.pd.target = DEFAULT_DOF_POS.copy()
         self.action_buffer = []
+        gait_cfg = self.cfg["gait"]
+        self.gait_phase = (float(self.rng.random())
+                           if self.randomize and gait_cfg["randomize_initial_phase"] else 0.0)
+        self.foot_air_time[:] = 0.0
+        self.last_foot_contacts[:] = False
+        self.feet_air_time_reward = 0.0
 
         if self.randomize:
             self._randomize_friction()
@@ -184,6 +218,7 @@ class QuadrupedEnv:
         self._resample_commands(first=True)
 
         mujoco.mj_forward(self.model, self.data)
+        self.last_foot_contacts = self._get_foot_contacts()
         return self._get_obs(), {}
 
     def step(self, action: np.ndarray):
@@ -196,8 +231,12 @@ class QuadrupedEnv:
         self.last_action = self.actions.copy()
         self.actions = action
 
-        # 动作 → 目标关节角（PD 控制器内部完成）
-        self.pd.set_action(action)
+        # 残差控制：默认站姿 + 参数化参考小跑 + PPO 修正量。
+        self.reference_action = self._get_reference_joint_offsets()
+        residual_cfg = self.cfg["gait"]["residual_control"]
+        residual_offsets = (self.pd.action_scale * self.curriculum_residual_scale * action
+                            if residual_cfg["enabled"] else self.pd.action_scale * action)
+        self.pd.set_target_offsets(self.reference_action + residual_offsets)
 
         # 随机推一把（指令重采样时按概率触发，模拟外力干扰）
         push_cfg = self.cfg["domain_randomization"]["push"]
@@ -209,6 +248,10 @@ class QuadrupedEnv:
         for _ in range(self.decimation):
             self.data.ctrl[:] = self.pd.compute_torques()
             mujoco.mj_step(self.model, self.data)
+
+        frequency = self.cfg["gait"]["phase_frequency"] * self.curriculum_frequency_scale
+        self.gait_phase = (self.gait_phase + self.dt * frequency) % 1.0
+        self._update_foot_air_time()
 
         self.step_count += 1
         self.command_steps += 1
@@ -229,6 +272,12 @@ class QuadrupedEnv:
                 self.data.qpos[3:7], self.data.qvel[0:3]).copy(),
             "base_ang_vel": _quat_rotate_inverse(
                 self.data.qpos[3:7], self.data.qvel[3:6]).copy(),
+            "foot_contacts": self.last_foot_contacts.copy(),
+            "foot_contact_forces": self.foot_contact_forces.copy(),
+            "foot_heights": self._get_foot_heights(),
+            "reference_action": self.reference_action.copy(),
+            "body_contact_count": self.body_contact_count,
+            "torso_contact_count": self.torso_contact_count,
         }
         return obs, reward, terminated, truncated, info
 
@@ -236,10 +285,16 @@ class QuadrupedEnv:
         """评估时由外部脚本设定指令（command_override=True 时生效）。"""
         self.commands[:] = [vx, vy, yaw_rate]
 
-    def set_curriculum(self, command_scale: float, randomization_scale: float):
+    def set_curriculum(self, command_scale: float, randomization_scale: float,
+                       residual_scale: float | None = None,
+                       frequency_scale: float | None = None):
         """设置课程难度；范围均为 [0, 1]，通常由训练循环逐步提升。"""
         self.curriculum_command_scale = float(np.clip(command_scale, 0.0, 1.0))
         self.curriculum_randomization_scale = float(np.clip(randomization_scale, 0.0, 1.0))
+        if residual_scale is not None:
+            self.curriculum_residual_scale = float(np.clip(residual_scale, 0.0, 1.0))
+        if frequency_scale is not None:
+            self.curriculum_frequency_scale = float(max(0.0, frequency_scale))
 
     def get_default_dof_pos(self) -> np.ndarray:
         return DEFAULT_DOF_POS.copy()
@@ -268,6 +323,12 @@ class QuadrupedEnv:
             dof_vel,
             self.actions,
         ])
+        if self.include_gait_obs:
+            angle = 2.0 * np.pi * self.gait_phase
+            obs_parts.extend([
+                np.array([np.sin(angle), np.cos(angle)]),
+                self._get_foot_contacts().astype(float),
+            ])
         obs = np.concatenate(obs_parts) * self.obs_scales
 
         if self.add_noise:
@@ -283,6 +344,8 @@ class QuadrupedEnv:
                 self.rng.normal(0.0, n["dof_vel"], self.num_joints),
                 np.zeros(self.num_joints),          # 动作不加噪
             ])
+            if self.include_gait_obs:
+                noise_parts.extend([np.zeros(2), np.zeros(len(self.foot_geom_ids))])
             noise = np.concatenate(noise_parts)
             obs += noise
         return obs.astype(np.float32)
@@ -319,19 +382,9 @@ class QuadrupedEnv:
         violation = np.maximum(0.0, (DOF_LOWER + margin) - q_joint) + \
                     np.maximum(0.0, q_joint - (DOF_UPPER - margin))
 
-        foot_contacts = set()
-        undesired_contacts = 0
-        foot_set = set(self.foot_geom_ids)
-        for contact in self.data.contact:
-            pair = {contact.geom1, contact.geom2}
-            if self.floor_geom_id not in pair:
-                continue
-            other = next(iter(pair - {self.floor_geom_id}))
-            # 足球和同一末端 body 上的小腿胶囊会同时产生地面接触，均视为合法支撑。
-            if other in foot_set or int(self.model.geom_bodyid[other]) in self.foot_body_ids:
-                foot_contacts.add(other)
-            elif other != self.torso_geom_id:
-                undesired_contacts += 1
+        contact_data = self._contact_state()
+        foot_contacts = contact_data["contact_geoms"]
+        undesired_contacts = contact_data["body_contacts"]
         feet_slip = 0.0
         for geom_id in foot_contacts:
             body_id = int(self.model.geom_bodyid[geom_id])
@@ -341,6 +394,9 @@ class QuadrupedEnv:
         horizontal_speed = float(np.linalg.norm(base_lin_vel[:2]))
         no_motion = (linear_command_norm > r_cfg["moving_command_threshold"] and
                      horizontal_speed < r_cfg["stationary_velocity_threshold"])
+        foot_contacts_bool = contact_data["contacts"]
+        gait_terms = self._gait_style_terms(foot_contacts_bool, contact_data["forces"])
+        moving = command_norm > r_cfg["moving_command_threshold"]
 
         w = r_cfg["weights"]
         components = {
@@ -360,9 +416,125 @@ class QuadrupedEnv:
             "stand_pose": w["stand_pose"] * float(np.sum((q_joint - DEFAULT_DOF_POS) ** 2))
                           if command_norm < r_cfg["stand_command_threshold"] else 0.0,
             "no_motion": w["no_motion"] if no_motion else 0.0,
+            "gait_contact": w["gait_contact"] * gait_terms["contact"] if moving else 0.0,
+            "foot_clearance": w["foot_clearance"] * gait_terms["clearance"] if moving else 0.0,
+            "landing_velocity": w["landing_velocity"] * gait_terms["landing_velocity"]
+                                if moving else 0.0,
+            "feet_air_time": w["feet_air_time"] * self.feet_air_time_reward if moving else 0.0,
             "termination": w["termination"] if terminated else 0.0,
         }
         return float(sum(components.values())), components
+
+    def _get_foot_contacts(self) -> np.ndarray:
+        """Return force-thresholded contacts in FL/FR/RL/RR order."""
+        return self._contact_state()["contacts"]
+
+    def _contact_state(self) -> dict:
+        """Classify floor contacts and aggregate MuJoCo normal forces per foot."""
+        forces = np.zeros(len(self.foot_body_ids))
+        contact_geoms, body_contacts, torso_contacts = set(), 0, 0
+        wrench = np.zeros(6)
+        for index, contact in enumerate(self.data.contact):
+            pair = {contact.geom1, contact.geom2}
+            if self.floor_geom_id not in pair:
+                continue
+            other = contact.geom2 if contact.geom1 == self.floor_geom_id else contact.geom1
+            body_id = int(self.model.geom_bodyid[other])
+            foot_index = self.foot_body_id_to_index.get(body_id)
+            if foot_index is not None:
+                mujoco.mj_contactForce(self.model, self.data, index, wrench)
+                forces[foot_index] += abs(float(wrench[0]))
+                contact_geoms.add(other)
+            elif other == self.torso_geom_id:
+                torso_contacts += 1
+            else:
+                body_contacts += 1
+        gait_cfg = self.cfg["gait"]
+        on_threshold = float(gait_cfg["contact_force_threshold"])
+        off_threshold = float(gait_cfg["contact_force_release_threshold"])
+        contacts = np.where(self.last_foot_contacts,
+                            forces >= off_threshold, forces >= on_threshold)
+        self.foot_contact_forces = forces
+        self.body_contact_count = body_contacts
+        self.torso_contact_count = torso_contacts
+        return {"contacts": contacts.astype(bool), "forces": forces,
+                "contact_geoms": contact_geoms, "body_contacts": body_contacts,
+                "torso_contacts": torso_contacts}
+
+    def _phase_weights(self) -> tuple[np.ndarray, np.ndarray]:
+        """Smooth diagonal-trot stance/swing weights for FL/FR/RL/RR."""
+        cfg = self.cfg["gait"]
+        phase_offsets = np.asarray(cfg["leg_phase_offsets"], dtype=float)
+        local = (self.gait_phase + phase_offsets) % 1.0
+        duty = float(cfg["duty_factor"])
+        smoothing = max(float(cfg["phase_smoothing"]), 1e-4)
+        # Smooth periodic interval [0, duty] using circular distance to its centre.
+        distance = np.abs((local - duty / 2.0 + 0.5) % 1.0 - 0.5)
+        stance = 1.0 / (1.0 + np.exp((distance - duty / 2.0) / smoothing))
+        return stance, 1.0 - stance
+
+    def _get_foot_heights(self) -> np.ndarray:
+        return np.asarray([self.data.geom_xpos[gid, 2] for gid in self.foot_geom_ids])
+
+    def _get_foot_vertical_velocities(self) -> np.ndarray:
+        result = np.zeros(len(self.foot_body_ids))
+        velocity = np.zeros(6)
+        for i, body_id in enumerate(self.foot_body_ids):
+            mujoco.mj_objectVelocity(self.model, self.data, mujoco.mjtObj.mjOBJ_BODY,
+                                     body_id, velocity, 0)
+            result[i] = velocity[5]
+        return result
+
+    def _gait_style_terms(self, contacts: np.ndarray, forces: np.ndarray) -> dict:
+        """Zero-at-best style costs; all-feet-down always receives a contact penalty."""
+        stance, swing = self._phase_weights()
+        cfg = self.cfg["gait"]
+        force_scale = max(float(cfg["contact_force_normalization"]), 1e-6)
+        contact_strength = np.clip(forces / force_scale, 0.0, 1.0)
+        swing_contact = np.mean(swing * contact_strength)
+        stance_miss = np.mean(stance * (~contacts).astype(float))
+        heights = self._get_foot_heights()
+        clearance_error = np.mean(swing * np.maximum(
+            float(cfg["swing_foot_height"]) - heights, 0.0) ** 2)
+        vertical_velocity = self._get_foot_vertical_velocities()
+        touchdown = contacts & ~self.last_foot_contacts
+        landing_cost = np.mean(touchdown * np.maximum(-vertical_velocity, 0.0) ** 2)
+        return {"contact": -float(swing_contact + stance_miss),
+                "clearance": -float(clearance_error),
+                "landing_velocity": -float(landing_cost)}
+
+    def _get_reference_joint_offsets(self) -> np.ndarray:
+        """Parameterized diagonal-trot reference in radians, disabled near zero command."""
+        cfg = self.cfg["gait"]["reference"]
+        moving = float(np.linalg.norm(self.commands)) > self.cfg["rewards"]["moving_command_threshold"]
+        if not cfg["enabled"] or not moving:
+            return np.zeros(self.act_dim)
+        speed = float(np.linalg.norm(self.commands[:2]))
+        speed_scale = np.clip(speed / max(float(cfg["nominal_speed"]), 1e-6),
+                              float(cfg["minimum_speed_scale"]),
+                              float(cfg["maximum_speed_scale"]))
+        phase_offsets = np.asarray(self.cfg["gait"]["leg_phase_offsets"], dtype=float)
+        local = (self.gait_phase + phase_offsets) % 1.0
+        stance, swing = self._phase_weights()
+        del stance
+        offsets = np.zeros((len(phase_offsets), 3))
+        amplitudes = np.asarray(cfg["joint_amplitudes"], dtype=float)
+        biases = np.asarray(cfg["joint_biases"], dtype=float)
+        wave = np.sin(2.0 * np.pi * local + float(cfg["phase_bias"]))
+        offsets[:] = biases + speed_scale * wave[:, None] * amplitudes[None, :]
+        offsets[:, 2] += speed_scale * float(cfg["swing_knee_lift"]) * swing
+        offsets[:, 0] *= np.asarray(cfg["abduction_leg_signs"], dtype=float)
+        return offsets.reshape(-1)
+
+    def _update_foot_air_time(self):
+        contacts = self._get_foot_contacts()
+        self.foot_air_time += self.dt
+        touchdown = contacts & ~self.last_foot_contacts
+        target = self.cfg["gait"]["air_time_target"]
+        self.feet_air_time_reward = float(np.sum(np.maximum(self.foot_air_time - target, 0.0)
+                                                 * touchdown))
+        self.foot_air_time[contacts] = 0.0
+        self.last_foot_contacts = contacts
 
     # ------------------------------------------------------------------ #
     # 终止、指令、随机化

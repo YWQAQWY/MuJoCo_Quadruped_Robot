@@ -60,13 +60,19 @@ evaluation:
     tracking_error_weight: 100.0
     fall_penalty: 200.0
     minimum_survival_rate: 0.9
+    minimum_consecutive_evaluations: 1
     linear_error_success_threshold: 0.2
     yaw_error_success_threshold: 0.2
+    command_zero_threshold: 0.05
+    minimum_speed_ratio: 0.6
+    minimum_yaw_rate_ratio: 0.6
+    stationary_speed_threshold: 0.05
 
 logging:
   print_every: 10
 
 curriculum:                  # 先学站稳和低速，再逐渐增加任务难度
+  mode: linear               # linear / competence；stage2 使用能力驱动模式
   enabled: true
   start_fraction: 0.0        # 训练总进度达到此比例时开始增长
   end_fraction: 0.6          # 达到此比例时使用完整指令和完整随机化

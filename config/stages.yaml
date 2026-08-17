@@ -19,6 +19,7 @@ stage1_stand:
       best_score:
         minimum_survival_rate: 0.95
         minimum_success_rate: 1.0
+        minimum_consecutive_evaluations: 2
   env:
     commands:
       stand_still_prob: 1.0
@@ -27,16 +28,23 @@ stage1_stand:
       ranges: {vx: [0.0, 0.0], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
 
 stage2_forward:
-  description: 保留站立能力，学习起步、前进、变速和停止
-  inherit_optimizer: true
+  description: 参考对角小跑加残差 PPO，保留站立并学习起步、前进、变速和停止
+  inherit_optimizer: false
   train:
     training:
       iterations: 500
+      reference_gait_preflight: true
     curriculum:
-      command_scale_start: 0.0
-      randomization_scale_start: 0.05
-      randomization_scale_end: 0.25
-      end_fraction: 0.8
+      mode: competence
+      promotion:
+        minimum_survival_rate: 0.95
+        minimum_success_rate: 0.75
+        consecutive_evaluations: 2
+      levels:
+        - {command_scale: 0.0, randomization_scale: 0.0, residual_scale: 0.15, frequency_scale: 1.0}
+        - {command_scale: 0.35, randomization_scale: 0.0, residual_scale: 0.25, frequency_scale: 1.0}
+        - {command_scale: 0.7, randomization_scale: 0.1, residual_scale: 0.35, frequency_scale: 1.0}
+        - {command_scale: 1.0, randomization_scale: 0.25, residual_scale: 0.5, frequency_scale: 1.0}
     evaluation:
       commands:
         - [0.0, 0.0, 0.0]
@@ -46,13 +54,28 @@ stage2_forward:
       episodes: 4
       best_score:
         minimum_survival_rate: 0.95
-        minimum_success_rate: 0.75
+        minimum_success_rate: 1.0
   env:
     commands:
       stand_still_prob: 0.2
       stand_still_prob_final: 0.15
       curriculum_start_ranges: {vx: [0.1, 0.3], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
       ranges: {vx: [0.1, 0.6], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+    gait:
+      phase_frequency: 1.8
+      duty_factor: 0.52
+      randomize_initial_phase: false
+      residual_control: {enabled: true, scale: 0.2}
+      reference:
+        enabled: true
+        joint_amplitudes: [0.0, -0.15, -0.1]
+        swing_knee_lift: 0.45
+        phase_bias: -0.8
+    domain_randomization:
+      push: {probability: 0.0}
+      init: {rpy_noise: 0.05, dof_pos_noise: 0.02}
+  pd:
+    action_scale: 0.4
 
 stage3_backward_yaw:
   description: 保留站立和前进，加入后退与原地转向
@@ -79,6 +102,7 @@ stage3_backward_yaw:
       stand_still_prob_final: 0.1
       curriculum_start_ranges: {vx: [-0.2, 0.5], vy: [0.0, 0.0], yaw_rate: [-0.2, 0.2]}
       ranges: {vx: [-0.6, 0.8], vy: [0.0, 0.0], yaw_rate: [-0.8, 0.8]}
+  pd: {action_scale: 0.4}
 
 stage4_lateral_combined:
   description: 加入横移以及平移和转向组合
@@ -106,6 +130,7 @@ stage4_lateral_combined:
       stand_still_prob_final: 0.1
       curriculum_start_ranges: {vx: [-0.4, 0.7], vy: [-0.2, 0.2], yaw_rate: [-0.4, 0.4]}
       ranges: {vx: [-0.8, 1.0], vy: [-0.5, 0.5], yaw_rate: [-1.0, 1.0]}
+  pd: {action_scale: 0.4}
 
 stage5_robust:
   description: 完整指令、完整域随机化和抗推搡
@@ -133,3 +158,4 @@ stage5_robust:
       stand_still_prob_final: 0.1
       curriculum_start_ranges: {vx: [-0.8, 0.8], vy: [-0.4, 0.4], yaw_rate: [-0.8, 0.8]}
       ranges: {vx: [-1.0, 1.0], vy: [-0.6, 0.6], yaw_rate: [-1.0, 1.0]}
+  pd: {action_scale: 0.4}

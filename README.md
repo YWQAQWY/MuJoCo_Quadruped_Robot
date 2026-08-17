@@ -31,7 +31,7 @@ How the trained PPO policy drives the robot, end to end:
   ┌────────────────────────────────────────────────────────────────────────┐
   │  PPO policy (runs at 50 Hz in PPO.py)                                  │
   │                                                                        │
-  │  obs (48-d) ──► PolicyNet (tanh Gaussian) ──► action a ∈ R¹²          │
+  │  obs (54-d) ──► PolicyNet (tanh Gaussian) ──► action a ∈ R¹²          │
   │                [base ang vel, projected  [clipped to [-1, 1]]          │
   │                 gravity, commands, joint                               │
   │                 pos/vel, previous action]                              │
@@ -52,7 +52,7 @@ How the trained PPO policy drives the robot, end to end:
   └───────────┬────────────────────────────────────────────────────────────┘
               │
               ├──► reward (velocity tracking + penalties) ──► GAE ──► PPO update
-              └──► next obs (48-d，含机体线速度) ──► back to policy
+              └──► next obs (54-d，含线速度/phase/足端接触) ──► policy
 ```
 
 - **Policy outputs actions, not torques.** Each of the 12 actions is an offset added to the
@@ -109,6 +109,8 @@ All hyperparameters live in annotated YAML files under `config/`:
 | `config/env.yaml` | simulation timing, command ranges, observation scales/noise, reward weights, termination thresholds, domain randomization |
 | `config/pd.yaml` | PD gains (kp, kd), torque limit, action scale |
 | `config/train.yaml` | PPO hyperparameters (network, lr, epochs, ε, γ, λ) and training-loop settings (iterations, rollout length, seed, save interval, device) |
+| `config/stages.yaml` | staged tasks, competence curriculum, residual scale and stage gates |
+| `config/gait_scan.yaml` | reference-trot feasibility scan, physical thresholds and parameter grid |
 
 **Reward / penalty values** are defined in `config/env.yaml` (the `rewards.weights` block plus the
 related thresholds under `rewards:`). The per-term computation and their trigger conditions are
@@ -130,6 +132,9 @@ Actor、Critic 和优化器动量，但将新阶段 iteration、课程进度和 
 意外中断才使用 `--resume`。
 
 ```bash
+# 第二阶段训练前必须先验证参考步态；失败时脚本会返回非零状态并禁止训练
+.venv/bin/python scripts/validate_reference_gait.py
+
 # 第二阶段：从第一阶段站立模型学习基础前进
 .venv/bin/python scripts/train_ppo.py --stage stage2_forward \
   --init-checkpoint runs/locomotion_v2/best.pt --run-name stage2_forward
@@ -141,6 +146,10 @@ Actor、Critic 和优化器动量，但将新阶段 iteration、课程进度和 
 .venv/bin/python scripts/train_ppo.py --stage stage3_backward_yaw \
   --init-checkpoint runs/stage2_forward/best.pt --run-name stage3_backward_yaw
 ```
+
+第二阶段采用 `默认站姿 + 参考对角小跑 + PPO 残差`。静止指令会自动关闭参考步态；课程只有
+在连续两次评估达到存活率和逐指令速度门槛后才升级。参考轨迹、残差比例、接触力阈值、奖励
+和全部扫描参数均由 `config/` 中的 YAML 管理。
 
 每一阶段持续混入旧任务，并同时设置存活率与成功率门槛。未达到门槛时只保存 `last.pt`，
 不会生成误导性的 `best.pt`，此时不应进入下一阶段。
