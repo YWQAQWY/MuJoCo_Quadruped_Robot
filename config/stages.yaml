@@ -19,7 +19,6 @@ stage1_stand:
       best_score:
         minimum_survival_rate: 0.95
         minimum_success_rate: 1.0
-        minimum_consecutive_evaluations: 2
   env:
     commands:
       stand_still_prob: 1.0
@@ -38,29 +37,32 @@ stage2_forward:
       mode: competence
       promotion:
         minimum_survival_rate: 0.95
-        minimum_success_rate: 0.75
+        minimum_success_rate: 1.0
         consecutive_evaluations: 2
       levels:
-        - {command_scale: 0.0, randomization_scale: 0.0, residual_scale: 0.15, frequency_scale: 1.0}
-        - {command_scale: 0.35, randomization_scale: 0.0, residual_scale: 0.25, frequency_scale: 1.0}
-        - {command_scale: 0.7, randomization_scale: 0.1, residual_scale: 0.35, frequency_scale: 1.0}
-        - {command_scale: 1.0, randomization_scale: 0.25, residual_scale: 0.5, frequency_scale: 1.0}
+        - {command_scale: 0.0, randomization_scale: 0.0, residual_scale: 0.02, frequency_scale: 1.0}
+        - {command_scale: 0.35, randomization_scale: 0.0, residual_scale: 0.05, frequency_scale: 1.0}
+        - {command_scale: 0.7, randomization_scale: 0.1, residual_scale: 0.1, frequency_scale: 1.0}
+        - {command_scale: 1.0, randomization_scale: 0.25, residual_scale: 0.2, frequency_scale: 1.0}
     evaluation:
       commands:
         - [0.0, 0.0, 0.0]
         - [0.2, 0.0, 0.0]
         - [0.3, 0.0, 0.0]
-        - [0.5, 0.0, 0.0]
-      episodes: 4
+      episodes: 3
       best_score:
         minimum_survival_rate: 0.95
         minimum_success_rate: 1.0
+        minimum_consecutive_evaluations: 2
+        minimum_speed_ratio: 0.8
+        linear_error_success_threshold: 0.12
+        maximum_heading_drift_rate: 0.03
   env:
     commands:
       stand_still_prob: 0.2
       stand_still_prob_final: 0.15
-      curriculum_start_ranges: {vx: [0.1, 0.3], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
-      ranges: {vx: [0.1, 0.6], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+      curriculum_start_ranges: {vx: [0.2, 0.3], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
+      ranges: {vx: [0.2, 0.3], vy: [0.0, 0.0], yaw_rate: [0.0, 0.0]}
     gait:
       phase_frequency: 1.8
       duty_factor: 0.52
@@ -68,6 +70,11 @@ stage2_forward:
       residual_control: {enabled: true, scale: 0.2}
       reference:
         enabled: true
+        nominal_speed: 0.6
+        minimum_speed_scale: 0.2
+        maximum_speed_scale: 1.0
+        minimum_lift_scale: 0.9
+        maximum_lift_scale: 1.0
         joint_amplitudes: [0.0, -0.15, -0.1]
         swing_knee_lift: 0.45
         phase_bias: -0.8

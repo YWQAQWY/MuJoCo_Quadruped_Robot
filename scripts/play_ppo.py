@@ -115,7 +115,9 @@ def run_viewer(args, env, agent):
         key_callback=on_key,
     )
     if args.keyboard:
-        print("键盘控制：W/S 前后，A/D 左右，Q/E 转向，空格停止，R 重置")
+        print("键盘控制：↑/↓ 前后，←/→ 转向，Q/E 横移，空格停止，R 重置")
+        print("请先点击 MuJoCo viewer 窗口使其获得键盘焦点。stage2 仅支持前进/停止；"
+              "后退和转向需 stage3，横移需 stage4。")
     else:
         print("可视化窗口已打开：鼠标拖动=旋转视角，滚轮=缩放，R=重置")
 
@@ -153,20 +155,25 @@ def _update_keyboard_command(key, command, env):
     """处理一次键盘事件；独立函数便于无 GUI 单元测试。"""
     cfg = PLAY_CFG["keyboard"]
     keys = cfg["keys"]
+    # mujoco.viewer 传入 GLFW 键码；方向键等特殊键用名称映射
+    SPECIAL_KEYS = {"space": 32, "up": 265, "down": 264, "left": 263, "right": 262}
 
     def code(name):
-        value = keys[name]
-        return 32 if value.lower() == "space" else ord(value.lower())
+        value = keys[name].lower()
+        if value in SPECIAL_KEYS:
+            return SPECIAL_KEYS[value]
+        return ord(value)
 
     key = ord(chr(key).lower()) if 0 <= key < 128 and chr(key).isalpha() else key
+    handled = True
     if key == code("forward"):
         command[0] += cfg["linear_step"]
     elif key == code("backward"):
         command[0] -= cfg["linear_step"]
     elif key == code("left"):
-        command[1] += cfg["linear_step"]
+        command[1] += cfg["lateral_step"]
     elif key == code("right"):
-        command[1] -= cfg["linear_step"]
+        command[1] -= cfg["lateral_step"]
     elif key == code("yaw_left"):
         command[2] += cfg["yaw_step"]
     elif key == code("yaw_right"):
@@ -175,10 +182,21 @@ def _update_keyboard_command(key, command, env):
         command[:] = 0.0
     elif key == code("reset"):
         env.reset()
+    else:
+        handled = False
     command[:] = np.clip(command,
                          [-cfg["max_vx"], -cfg["max_vy"], -cfg["max_yaw_rate"]],
                          [cfg["max_vx"], cfg["max_vy"], cfg["max_yaw_rate"]])
     env.set_commands(*command)
+    if handled and cfg.get("print_commands", True):
+        key_name = {32: "SPACE", 265: "↑", 264: "↓", 263: "←", 262: "→"}.get(key)
+        if key_name is None:
+            try:
+                key_name = chr(key).upper()
+            except (TypeError, ValueError):
+                key_name = str(key)
+        print(f"按键={key_name} -> 指令 vx={command[0]:+.2f}, "
+              f"vy={command[1]:+.2f}, yaw={command[2]:+.2f}")
 
 
 def record_video(args, env, agent):
@@ -237,7 +255,7 @@ def main():
     from env.quadruped_env import QuadrupedEnv
 
     checkpoint_obs_dim = checkpoint_observation_dim(args.checkpoint)
-    if checkpoint_obs_dim not in (45, 48, 54):
+    if checkpoint_obs_dim not in (45, 48, 54, 57):
         raise ValueError(f"不支持的 checkpoint 观测维度: {checkpoint_obs_dim}")
     import torch
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -246,10 +264,20 @@ def main():
     env = QuadrupedEnv(seed=PLAY_CFG["seed"], add_noise=PLAY_CFG["add_noise"],
                        randomize=PLAY_CFG["randomize"],
                        command_override=PLAY_CFG["command_override"],
-                       include_base_lin_vel=checkpoint_obs_dim in (48, 54),
-                       include_gait_obs=checkpoint_obs_dim == 54,
+                       include_base_lin_vel=checkpoint_obs_dim in (48, 54, 57),
+                       include_gait_obs=checkpoint_obs_dim in (54, 57),
+                       include_heading_obs=checkpoint_obs_dim == 57,
                        config_override=saved_env,
                        pd_config_override=saved_pd)
+    # 回放必须使用训练时的残差尺度；旧 checkpoint 从课程等级推导
+    saved_residual = checkpoint.get("curriculum_residual_scale")
+    if saved_residual is None:
+        levels = checkpoint.get("config", {}).get("train", {}).get("curriculum", {}).get("levels")
+        level = (checkpoint.get("curriculum_state") or {}).get("level")
+        if levels and level is not None:
+            saved_residual = levels[int(level)].get("residual_scale")
+    if saved_residual is not None:
+        env.set_curriculum(0.0, 0.0, residual_scale=float(saved_residual))
     agent = load_agent(env, args)
     print(f"已加载 {args.checkpoint}（{checkpoint_obs_dim} 维观测）")
 

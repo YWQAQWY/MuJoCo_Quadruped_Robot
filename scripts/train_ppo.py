@@ -61,7 +61,8 @@ def parse_args():
 
 
 def make_checkpoint(agent, iteration, total_steps, best_eval_score, config,
-                    curriculum_state=None, best_gate_state=None):
+                    curriculum_state=None, best_gate_state=None,
+                    curriculum_residual_scale=None):
     return {
         "actor": agent.actor_net.state_dict(),
         "critic": agent.critic_net.state_dict(),
@@ -73,6 +74,7 @@ def make_checkpoint(agent, iteration, total_steps, best_eval_score, config,
         "config": config,
         "curriculum_state": copy.deepcopy(curriculum_state),
         "best_gate_state": copy.deepcopy(best_gate_state),
+        "curriculum_residual_scale": curriculum_residual_scale,
         "rng": {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
@@ -106,7 +108,8 @@ def load_state_with_input_expansion(module, source_state):
     return migrated
 
 
-def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None):
+def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None,
+             residual_scale=None):
     """固定指令评估；显式衡量跟踪误差，避免把稳定站立选为 best。"""
     commands = eval_cfg["commands"]
     episode_length = eval_cfg["episode_length"]
@@ -114,13 +117,16 @@ def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None):
                        add_noise=eval_cfg["add_noise"], randomize=eval_cfg["randomize"],
                        command_override=eval_cfg["command_override"],
                        config_override=env_override, pd_config_override=pd_override)
+    # 评估必须使用与当前课程等级一致的残差尺度，否则策略残差被放大（默认 0.2 vs level0 的 0.02）
+    if residual_scale is not None:
+        env.set_curriculum(0.0, 0.0, residual_scale=residual_scale)
     rewards, lengths, lin_errors, yaw_errors, successes, command_metrics = [], [], [], [], [], []
     falls = 0
     for ep in range(eval_cfg["episodes"]):
         obs, _ = env.reset()
         env.set_commands(*commands[ep % len(commands)])
         total = 0.0
-        episode_lin_errors, episode_yaw_errors, velocities, yaw_rates = [], [], [], []
+        episode_lin_errors, velocities, yaw_rates, yaw_angles = [], [], [], []
         contact_samples, diagonal_scores, body_contacts = [], [], []
         for step in range(episode_length):
             obs, reward, terminated, truncated, info = env.step(
@@ -128,11 +134,10 @@ def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None):
             )
             total += reward
             lin_error = float(np.linalg.norm(np.asarray(env.commands[:2]) - info["base_lin_vel"][:2]))
-            yaw_error = float(abs(env.commands[2] - info["base_ang_vel"][2]))
             episode_lin_errors.append(lin_error)
-            episode_yaw_errors.append(yaw_error)
             velocities.append(np.asarray(info["base_lin_vel"][:2]))
             yaw_rates.append(float(info["base_ang_vel"][2]))
+            yaw_angles.append(float(info["base_rpy"][2]))
             contacts = np.asarray(info["foot_contacts"], dtype=bool)
             contact_samples.append(contacts.astype(float))
             diagonal_scores.append(float((contacts[0] == contacts[3]) and
@@ -146,11 +151,21 @@ def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None):
         rewards.append(total)
         lengths.append(step + 1)
         lin_errors.extend(episode_lin_errors)
-        yaw_errors.extend(episode_yaw_errors)
         score_cfg = eval_cfg["best_score"]
         command = np.asarray(commands[ep % len(commands)], dtype=float)
         mean_velocity = np.mean(velocities, axis=0)
         mean_yaw_rate = float(np.mean(yaw_rates))
+        unwrapped_yaw = np.unwrap(np.asarray(yaw_angles))
+        duration = max((len(unwrapped_yaw) - 1) * env.dt, env.dt)
+        heading_drift_rate = float((unwrapped_yaw[-1] - unwrapped_yaw[0]) / duration)
+        yaw_oscillation = float(np.sqrt(np.mean(
+            (np.asarray(yaw_rates) - mean_yaw_rate) ** 2)))
+        # Turning evaluates mean rate tracking. Straight walking evaluates net
+        # heading drift, so normal left/right gait oscillation does not look like bias.
+        yaw_moving = abs(command[2]) > score_cfg["command_zero_threshold"]
+        episode_yaw_error = abs(command[2] - (mean_yaw_rate if yaw_moving
+                                               else heading_drift_rate))
+        yaw_errors.append(episode_yaw_error)
         linear_command_norm = float(np.linalg.norm(command[:2]))
         actual_speed = float(np.linalg.norm(mean_velocity))
         moving = linear_command_norm > score_cfg["command_zero_threshold"]
@@ -158,21 +173,25 @@ def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None):
         speed_ratio_ok = (not moving or actual_speed >=
                           score_cfg["minimum_speed_ratio"] * linear_command_norm)
         stationary_ok = (moving or actual_speed < score_cfg["stationary_speed_threshold"])
-        yaw_moving = abs(command[2]) > score_cfg["command_zero_threshold"]
         yaw_direction_ok = not yaw_moving or mean_yaw_rate * command[2] > 0.0
         yaw_ratio_ok = not yaw_moving or abs(mean_yaw_rate) >= (
             score_cfg["minimum_yaw_rate_ratio"] * abs(command[2]))
         success = (np.mean(episode_lin_errors) < score_cfg["linear_error_success_threshold"] and
-                   np.mean(episode_yaw_errors) < score_cfg["yaw_error_success_threshold"] and
+                   episode_yaw_error < score_cfg["yaw_error_success_threshold"] and
                    direction_ok and speed_ratio_ok and stationary_ok and
-                   yaw_direction_ok and yaw_ratio_ok and not terminated)
+                   yaw_direction_ok and yaw_ratio_ok and
+                   (yaw_moving or yaw_oscillation <= score_cfg["maximum_yaw_oscillation"]) and
+                   (yaw_moving or abs(heading_drift_rate) <=
+                    score_cfg["maximum_heading_drift_rate"]) and
+                   not terminated)
         successes.append(float(success))
         contacts_array = np.asarray(contact_samples)
         command_metrics.append({
             "command": command.tolist(), "actual_velocity": mean_velocity.tolist(),
             "actual_yaw_rate": mean_yaw_rate,
             "linear_error": float(np.mean(episode_lin_errors)),
-            "yaw_error": float(np.mean(episode_yaw_errors)),
+            "yaw_error": episode_yaw_error, "heading_drift_rate": heading_drift_rate,
+            "yaw_oscillation": yaw_oscillation,
             "survived": not terminated, "success": bool(success),
             "foot_contact_rates": np.mean(contacts_array, axis=0).tolist(),
             "foot_air_rates": np.mean(~contacts_array.astype(bool), axis=0).tolist(),
@@ -192,6 +211,31 @@ def evaluate(agent, seed, eval_cfg, env_override=None, pd_override=None):
         "survival_rate": survival_rate, "success_rate": float(np.mean(successes)),
         "score": tracking_score, "commands": command_metrics,
     }
+
+
+def print_evaluation_summary(iteration, metrics, curriculum_state, log_cfg):
+    """Human-readable strict evaluation report for the training terminal."""
+    if not log_cfg.get("print_evaluation_summary", True):
+        return
+    level = curriculum_state["level"] if curriculum_state is not None else -1
+    print("评估 "
+          f"iter={iteration + 1} | 成功率={metrics['success_rate'] * 100:.1f}% | "
+          f"存活率={metrics['survival_rate'] * 100:.1f}% | "
+          f"线速度误差={metrics['linear_error']:.3f} m/s | "
+          f"偏航误差={metrics['yaw_error']:.3f} rad/s | 课程等级={level}")
+    if not log_cfg.get("print_command_metrics", True):
+        return
+    for item in metrics.get("commands", []):
+        command = item["command"]
+        actual = item["actual_velocity"]
+        result = "通过" if item["success"] else "失败"
+        print(f"  指令=({command[0]:+.2f},{command[1]:+.2f},{command[2]:+.2f}) "
+              f"实际=({actual[0]:+.3f},{actual[1]:+.3f}) "
+              f"yaw={item['actual_yaw_rate']:+.3f} "
+              f"线误差={item['linear_error']:.3f} 偏航误差={item['yaw_error']:.3f} "
+              f"航向漂移={item.get('heading_drift_rate', float('nan')):+.3f} "
+              f"偏航摆动={item.get('yaw_oscillation', float('nan')):.3f} "
+              f"存活={'是' if item['survived'] else '否'} {result}")
 
 
 def curriculum_scales(iteration, iterations, cfg):
@@ -254,11 +298,22 @@ def verify_reference_gait_preflight(env_cfg, training_cfg):
         "swing_knee_lift": reference["swing_knee_lift"],
         "phase_bias": reference["phase_bias"],
     }
+    active_scaling = {key: reference[key] for key in (
+        "nominal_speed", "minimum_speed_scale", "maximum_speed_scale",
+        "minimum_lift_scale", "maximum_lift_scale")}
     report = json.loads(report_path.read_text(encoding="utf-8"))
     matches = [item for item in report if item.get("qualified") and
-               all(np.isclose(item["parameters"][key], value) for key, value in active.items())]
+               all(np.isclose(item["parameters"][key], value) for key, value in active.items()) and
+               all(np.isclose(item.get("reference_scaling", {}).get(key, np.nan), value)
+                   for key, value in active_scaling.items())]
     if not matches:
         raise RuntimeError(f"当前参考步态未通过物理硬门槛: {active}；请重新运行扫描并更新配置")
+    profile_path = ROOT / scan_cfg["profile_report_path"]
+    if not profile_path.exists():
+        raise RuntimeError("缺少全指令速度映射报告；请重新运行参考步态扫描")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    if not profile or not all(item.get("qualified") for item in profile):
+        raise RuntimeError("参考步态未通过全指令速度映射验证")
     print(f"参考步态预检通过: vx={matches[0]['forward_velocity']:.3f} m/s")
 
 
@@ -476,10 +531,12 @@ def main():
         should_eval = (it + 1) % eval_cfg["every"] == 0 or it == iterations - 1
         if should_eval:
             eval_metrics = evaluate(
-                agent, seed + eval_cfg["seed_offset"], eval_cfg, env_override, pd_override
+                agent, seed + eval_cfg["seed_offset"], eval_cfg, env_override, pd_override,
+                residual_scale=residual_scale,
             )
             eval_reward = eval_metrics["reward"]
             eval_ep_len = eval_metrics["episode_length"]
+            print_evaluation_summary(it, eval_metrics, curriculum_state, log_cfg)
             if update_competence_curriculum(curriculum_state, curriculum_cfg, eval_metrics):
                 print(f"课程晋级到 level {curriculum_state['level']}：下一轮应用新难度")
         writer.writerow([
@@ -515,7 +572,8 @@ def main():
         if is_new_best:
             best_eval_score = eval_metrics["score"]
         checkpoint = make_checkpoint(agent, it, total_steps, best_eval_score, effective_config,
-                                     curriculum_state, best_gate_state)
+                                     curriculum_state, best_gate_state,
+                                     curriculum_residual_scale=residual_scale)
         if (it + 1) % save_every == 0:
             torch.save(checkpoint, run_dir / f"checkpoint_{it + 1}.pt")
         if tr_cfg["checkpoint_every_iteration"] or it == iterations - 1:

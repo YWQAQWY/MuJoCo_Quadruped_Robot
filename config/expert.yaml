@@ -1,0 +1,51 @@
+# DogML -> 当前 12-DOF MuJoCo 机器人专家数据转换与行为克隆
+source_root: dataset
+motion_dir: dataset/motion/robot
+text_dir: dataset/text
+output_path: dataset/processed/walk_expert.npz
+report_path: dataset/processed/walk_expert_report.json
+labels: [walk, trot]
+source_fps: 60.0
+target_fps: 50.0
+max_clips: 300
+seed: 17
+
+retarget:
+  # DogML chain 0/1/2/3 -> 当前 FL/FR/RL/RR；正 dataset-x 作为机器人左侧
+  leg_chain_order: [1, 0, 3, 2]
+  chains: [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]]
+  hip_point_in_chain: 1
+  foot_point_in_chain: 3
+  source_up_axis: 1
+  source_forward_axis: 2
+  source_lateral_axis: 0
+  forward_sign: -1.0
+  lateral_sign: 1.0
+  leg_length_scale: 1.0
+  link_lengths: [0.2, 0.2]
+  joint_margin: 0.02
+  smoothing_window: 5
+
+replay:
+  action_scale: 0.4
+  command_min: 0.1
+  command_max: 0.5
+  warmup_frames: 10
+  minimum_survival_fraction: 1.0
+  minimum_clip_samples: 100
+  maximum_body_contacts: 0
+  maximum_abs_yaw_rate: 0.5
+  maximum_velocity_error: 0.15
+  maximum_samples: 200000
+
+behavior_cloning:
+  init_checkpoint: runs/locomotion_v2/best.pt
+  output_checkpoint: runs/expert_bc/best.pt
+  epochs: 30
+  batch_size: 512
+  learning_rate: 1.0e-4
+  validation_fraction: 0.1
+  weight_decay: 1.0e-5
+  gradient_clip: 1.0
+  seed: 17
+  minimum_training_samples: 5000

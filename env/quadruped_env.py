@@ -66,6 +66,7 @@ class QuadrupedEnv:
         command_override: bool = False,      # 评估时由外部脚本设定指令
         include_base_lin_vel: bool = True,   # 新策略为 48 维；旧 checkpoint 可使用 45 维
         include_gait_obs: bool = True,       # phase(2)+足端接触(4)，新版共 54 维
+        include_heading_obs: bool = True,    # 航向误差 sin/cos + 低通偏航率(3)，新版共 57 维
         config_override: dict | None = None, # 分阶段训练只覆盖需要改变的 env 字段
         pd_config_override: dict | None = None,
     ):
@@ -82,12 +83,14 @@ class QuadrupedEnv:
         self.command_override = command_override
         self.include_base_lin_vel = include_base_lin_vel
         self.include_gait_obs = include_gait_obs
+        self.include_heading_obs = include_heading_obs
         self.dt = self.model.opt.timestep * self.decimation  # 控制周期 0.02 s
 
         self.num_joints = len(DEFAULT_DOF_POS)
         self.act_dim = self.num_joints
         self.obs_dim = ((3 if include_base_lin_vel else 0) + 3 + 3 + 3 +
-                        3 * self.num_joints + (6 if include_gait_obs else 0))
+                        3 * self.num_joints + (6 if include_gait_obs else 0) +
+                        (3 if include_heading_obs else 0))
         self.step_count = 0
 
         # 运动学/动力学索引
@@ -138,6 +141,8 @@ class QuadrupedEnv:
                 np.full(2, osc["phase"]),
                 np.full(len(self.foot_geom_ids), osc["foot_contacts"]),
             ])
+        if self.include_heading_obs:
+            scale_parts.append(np.array([osc["heading"], osc["heading"], osc["yaw_ema"]]))
         self.obs_scales = np.concatenate(scale_parts)
         self.obs_noise_std = self.cfg["observation"]["noise"]
 
@@ -150,6 +155,7 @@ class QuadrupedEnv:
         self.foot_air_time = np.zeros(len(self.foot_geom_ids))
         self.last_foot_contacts = np.zeros(len(self.foot_geom_ids), dtype=bool)
         self.feet_air_time_reward = 0.0
+        self.yaw_ema = 0.0
         self.curriculum_command_scale = 1.0
         self.curriculum_randomization_scale = 1.0
         self.curriculum_residual_scale = float(self.cfg["gait"]["residual_control"]["scale"])
@@ -169,6 +175,7 @@ class QuadrupedEnv:
         self.body_contact_count = 0
         self.torso_contact_count = 0
         self.reference_action = np.zeros(self.act_dim)
+        self.initial_yaw = 0.0
 
     # ------------------------------------------------------------------ #
     # 对外接口
@@ -209,6 +216,7 @@ class QuadrupedEnv:
         self.foot_air_time[:] = 0.0
         self.last_foot_contacts[:] = False
         self.feet_air_time_reward = 0.0
+        self.yaw_ema = 0.0
 
         if self.randomize:
             self._randomize_friction()
@@ -218,6 +226,7 @@ class QuadrupedEnv:
         self._resample_commands(first=True)
 
         mujoco.mj_forward(self.model, self.data)
+        self.initial_yaw = float(_quat_to_rpy(self.data.qpos[3:7])[2])
         self.last_foot_contacts = self._get_foot_contacts()
         return self._get_obs(), {}
 
@@ -329,6 +338,12 @@ class QuadrupedEnv:
                 np.array([np.sin(angle), np.cos(angle)]),
                 self._get_foot_contacts().astype(float),
             ])
+        if self.include_heading_obs:
+            # 航向误差进入观测：straight_heading 惩罚依赖它，actor/critic 必须能直接看到
+            current_yaw = float(_quat_to_rpy(q)[2])
+            heading = float(np.arctan2(np.sin(current_yaw - self.initial_yaw),
+                                       np.cos(current_yaw - self.initial_yaw)))
+            obs_parts.append(np.array([np.sin(heading), np.cos(heading), self.yaw_ema]))
         obs = np.concatenate(obs_parts) * self.obs_scales
 
         if self.add_noise:
@@ -346,6 +361,8 @@ class QuadrupedEnv:
             ])
             if self.include_gait_obs:
                 noise_parts.extend([np.zeros(2), np.zeros(len(self.foot_geom_ids))])
+            if self.include_heading_obs:
+                noise_parts.append(np.zeros(3))
             noise = np.concatenate(noise_parts)
             obs += noise
         return obs.astype(np.float32)
@@ -363,9 +380,15 @@ class QuadrupedEnv:
         dof_acc = (dof_vel - self.last_dof_vel) / self.dt
         torques = self.data.ctrl.copy()
         base_height = self.data.qpos[2]
+        current_yaw = float(_quat_to_rpy(q)[2])
+        heading_error = float(np.arctan2(np.sin(current_yaw - self.initial_yaw),
+                                         np.cos(current_yaw - self.initial_yaw)))
 
         cmd_vx, cmd_vy, cmd_yaw = self.commands
         r_cfg = self.cfg["rewards"]
+        # 低通滤波偏航率：隔离持续漂移与正常步态振荡，惩罚即时且可观测
+        self.yaw_ema = ((1.0 - float(r_cfg["yaw_drift_alpha"])) * self.yaw_ema +
+                        float(r_cfg["yaw_drift_alpha"]) * float(base_ang_vel[2]))
         base_height_target = ROBOT_CFG["base_height_target"]
 
         r_lin_vel = float(np.exp(-((cmd_vx - base_lin_vel[0]) ** 2 +
@@ -394,6 +417,9 @@ class QuadrupedEnv:
         horizontal_speed = float(np.linalg.norm(base_lin_vel[:2]))
         no_motion = (linear_command_norm > r_cfg["moving_command_threshold"] and
                      horizontal_speed < r_cfg["stationary_velocity_threshold"])
+        # Symmetric forward speed error: overshoot is penalised as much as
+        # undershoot, so a uniform speed bias cannot pay off.
+        forward_speed_error = abs(float(cmd_vx) - float(base_lin_vel[0]))
         foot_contacts_bool = contact_data["contacts"]
         gait_terms = self._gait_style_terms(foot_contacts_bool, contact_data["forces"])
         moving = command_norm > r_cfg["moving_command_threshold"]
@@ -404,6 +430,13 @@ class QuadrupedEnv:
             "ang_vel": w["ang_vel"] * r_ang_vel,
             "vel_z": w["vel_z"] * float(base_lin_vel[2] ** 2),
             "ang_xy": w["ang_xy"] * float(base_ang_vel[0] ** 2 + base_ang_vel[1] ** 2),
+            "lateral_velocity": w["lateral_velocity"] * float(base_lin_vel[1] ** 2),
+            "straight_heading": w["straight_heading"] * heading_error ** 2
+                                if moving and abs(cmd_yaw) < r_cfg["straight_yaw_threshold"]
+                                else 0.0,
+            "yaw_drift": w["yaw_drift"] * float(abs(self.yaw_ema))
+                         if moving and abs(cmd_yaw) < r_cfg["straight_yaw_threshold"]
+                         else 0.0,
             "height": w["base_height"] * r_height,
             "orient": w["orientation"] * float(projected_gravity[0] ** 2 + projected_gravity[1] ** 2),
             "action_rate": w["action_rate"] * float(np.sum((self.actions - self.last_action) ** 2)),
@@ -416,6 +449,8 @@ class QuadrupedEnv:
             "stand_pose": w["stand_pose"] * float(np.sum((q_joint - DEFAULT_DOF_POS) ** 2))
                           if command_norm < r_cfg["stand_command_threshold"] else 0.0,
             "no_motion": w["no_motion"] if no_motion else 0.0,
+            "speed_error": w["speed_error"] * forward_speed_error
+                           if moving else 0.0,
             "gait_contact": w["gait_contact"] * gait_terms["contact"] if moving else 0.0,
             "foot_clearance": w["foot_clearance"] * gait_terms["clearance"] if moving else 0.0,
             "landing_velocity": w["landing_velocity"] * gait_terms["landing_velocity"]
@@ -513,6 +548,9 @@ class QuadrupedEnv:
         speed_scale = np.clip(speed / max(float(cfg["nominal_speed"]), 1e-6),
                               float(cfg["minimum_speed_scale"]),
                               float(cfg["maximum_speed_scale"]))
+        lift_scale = np.clip(speed / max(float(cfg["nominal_speed"]), 1e-6),
+                             float(cfg["minimum_lift_scale"]),
+                             float(cfg["maximum_lift_scale"]))
         phase_offsets = np.asarray(self.cfg["gait"]["leg_phase_offsets"], dtype=float)
         local = (self.gait_phase + phase_offsets) % 1.0
         stance, swing = self._phase_weights()
@@ -522,7 +560,9 @@ class QuadrupedEnv:
         biases = np.asarray(cfg["joint_biases"], dtype=float)
         wave = np.sin(2.0 * np.pi * local + float(cfg["phase_bias"]))
         offsets[:] = biases + speed_scale * wave[:, None] * amplitudes[None, :]
-        offsets[:, 2] += speed_scale * float(cfg["swing_knee_lift"]) * swing
+        # Leg clearance must not collapse at low speed. Stride length follows the
+        # command, while swing knee lift has an independent lower bound.
+        offsets[:, 2] += lift_scale * float(cfg["swing_knee_lift"]) * swing
         offsets[:, 0] *= np.asarray(cfg["abduction_leg_signs"], dtype=float)
         return offsets.reshape(-1)
 

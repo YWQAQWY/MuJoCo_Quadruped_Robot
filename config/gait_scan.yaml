@@ -8,6 +8,19 @@ maximum_torso_contacts: 0
 maximum_all_feet_contact_rate: 0.8
 minimum_air_rate_per_foot: 0.05
 report_path: logs/reference_gait_scan.json
+profile_report_path: logs/reference_gait_profile.json
+profile_validation:
+  commands: [[0.2, 0.0, 0.0], [0.3, 0.0, 0.0], [0.5, 0.0, 0.0]]
+  maximum_linear_error: 0.1
+  maximum_lateral_speed: 0.05
+  maximum_yaw_rate: 0.1
+  minimum_survival_fraction: 1.0
+reference_scaling:
+  nominal_speed: 0.6
+  minimum_speed_scale: 0.2
+  maximum_speed_scale: 1.0
+  minimum_lift_scale: 0.9
+  maximum_lift_scale: 1.0
 
 # 笛卡尔积扫描。首次运行应先用较小集合确认关节方向，再扩展范围。
 grid:

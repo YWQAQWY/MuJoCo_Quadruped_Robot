@@ -67,9 +67,13 @@ evaluation:
     minimum_speed_ratio: 0.6
     minimum_yaw_rate_ratio: 0.6
     stationary_speed_threshold: 0.05
+    maximum_yaw_oscillation: 0.5 # 直行允许的周期角速度RMS；方向误差使用净航向漂移
+    maximum_heading_drift_rate: 0.03 # 直行10秒最多约0.3 rad净航向变化
 
 logging:
   print_every: 10
+  print_evaluation_summary: true # 每次评估打印总体成功率、存活率和逐指令结果
+  print_command_metrics: true    # 打印各指令实际速度、误差、偏航和通过状态
 
 curriculum:                  # 先学站稳和低速，再逐渐增加任务难度
   mode: linear               # linear / competence；stage2 使用能力驱动模式

@@ -27,7 +27,7 @@ def test_curriculum_schedule():
     stage_cfg = deep_merge(load("train"), stage["train"])["curriculum"]
     stage_state = initial_curriculum_state(stage_cfg)
     stage_start = curriculum_values(0, 500, stage_cfg, stage_state)
-    assert np.allclose(stage_start, [0.0, 0.0, 0.15, 1.0])
+    assert np.allclose(stage_start, [0.0, 0.0, 0.02, 1.0])
 
     env = QuadrupedEnv(seed=0, add_noise=False, randomize=False)
     env.set_curriculum(*start)
@@ -41,12 +41,14 @@ def test_curriculum_schedule():
 def test_velocity_observation_and_no_motion_penalty():
     env = QuadrupedEnv(seed=1, add_noise=False, randomize=False, command_override=True)
     obs, _ = env.reset()
-    assert obs.shape == (54,)
-    # 末尾为 phase sin/cos + FL/FR/RL/RR 接触状态。
-    assert obs[-6:].shape == (6,)
+    assert obs.shape == (57,)
+    # 末尾为 phase sin/cos + FL/FR/RL/RR 接触状态 + 航向 sin/cos + 低通偏航率。
+    assert obs[-7:-3].shape == (4,)
+    assert np.allclose(obs[-3:], [0.0, 1.0, 0.0], atol=1e-4)  # reset 时航向误差和漂移均为 0
     env.set_commands(0.5, 0.0, 0.0)
     _, _, _, _, info = env.step(np.zeros(env.act_dim))
     assert info["reward_components"]["no_motion"] < 0.0
+    assert info["reward_components"]["speed_error"] < 0.0
 
 
 def test_checkpoint_input_expansion():
@@ -102,16 +104,25 @@ def test_static_policy_cannot_pass_forward_evaluation():
     assert metrics["success_rate"] == 0.0
 
 
+def test_straight_gait_uses_heading_drift_not_absolute_yaw_rate():
+    # A zero-mean periodic yaw rate is normal in a trot and must not be treated
+    # as persistent turning. The strict oscillation gate remains separate.
+    rates = np.array([0.3, -0.3] * 50)
+    assert abs(np.mean(rates)) < 1e-12
+    assert np.sqrt(np.mean((rates - np.mean(rates)) ** 2)) == 0.3
+
+
 def test_keyboard_commands():
     env = QuadrupedEnv(seed=0, add_noise=False, randomize=False, command_override=True)
     env.reset()
     command = np.zeros(3)
-    _update_keyboard_command(ord("w"), command, env)
-    assert command[0] > 0 and np.allclose(env.commands, command)
-    _update_keyboard_command(ord("a"), command, env)
+    _update_keyboard_command(265, command, env)   # ↑ GLFW_KEY_UP
+    assert command[0] >= env.cfg["rewards"]["moving_command_threshold"]
+    assert np.allclose(env.commands, command)
+    _update_keyboard_command(263, command, env)   # ← GLFW_KEY_LEFT
     _update_keyboard_command(ord("q"), command, env)
     assert command[1] > 0 and command[2] > 0
-    _update_keyboard_command(32, command, env)
+    _update_keyboard_command(32, command, env)    # SPACE
     assert np.allclose(command, 0.0)
 
 
@@ -122,5 +133,6 @@ if __name__ == "__main__":
     test_reference_residual_and_gait_reward()
     test_competence_curriculum_requires_consecutive_passes()
     test_static_policy_cannot_pass_forward_evaluation()
+    test_straight_gait_uses_heading_drift_not_absolute_yaw_rate()
     test_keyboard_commands()
     print("[OK] 课程学习与键盘控制测试通过")

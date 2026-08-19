@@ -11,18 +11,20 @@ viewer_close_poll_seconds: 0.01
 viewer_close_grace_seconds: 0.05
 
 keyboard:
-  linear_step: 0.1          # 每次按键改变线速度 (m/s)
-  yaw_step: 0.1             # 每次按键改变角速度 (rad/s)
-  max_vx: 1.0
+  linear_step: 0.2          # 单次W即可超过0.15 m/s步态启动阈值
+  lateral_step: 0.2
+  yaw_step: 0.2
+  print_commands: true      # 每次有效按键立即在终端打印指令
+  max_vx: 0.3           # stage2 只训练 0.2–0.3 m/s，键盘钳位在训练范围内
   max_vy: 0.6
   max_yaw_rate: 1.0
   keys:
-    forward: w
-    backward: s
-    left: a
-    right: d
-    yaw_left: q
-    yaw_right: e
+    forward: up             # ↑ 前进
+    backward: down          # ↓ 后退（stage3 训练后可用）
+    yaw_left: left          # ← 左转（stage3 训练后可用）
+    yaw_right: right        # → 右转（stage3 训练后可用）
+    left: q                 # Q/E 横移（stage4 训练后可用）
+    right: e
     stop: space
     reset: r
 
